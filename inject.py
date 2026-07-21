@@ -206,5 +206,28 @@ def _get_story_footer(story_xml: str) -> str:
     return ''
 
 
+def extract_from_result(md_path: str) -> list[str]:
+    """
+    从句读结果 MD 文件提取字符序列。
+    - 跳过文件头（# 标题到第一个 --- 之间的元数据）
+    - 忽略换行、空格等 ASCII 空白字符
+    - 保留可见字符（含「。」和全角空格 U+3000）
+
+    返回: 字符列表，如 ['如', '是', '我', '聞', '。', '一', '時', '。', ...]
+    """
+    with open(md_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    # 跳过文件头（# 标题 到 第一个 --- 之间的内容）
+    parts = content.split('---', 1)
+    body = parts[1] if len(parts) > 1 else content
+
+    # 仅过滤 ASCII 空白字符（空格、制表符、换行、回车）
+    # 保留全角空格 U+3000（佛经偈颂中的分字空格）等 Unicode 空白
+    chars = [ch for ch in body if ch not in '\n\r\t ']
+
+    return chars
+
+
 if __name__ == "__main__":
     main()
