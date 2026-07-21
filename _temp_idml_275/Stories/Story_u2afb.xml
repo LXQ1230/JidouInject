@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<idPkg:Story xmlns:idPkg="http://ns.adobe.com/AdobeInDesign/idml/1.0/packaging" DOMVersion="19.0">
+	<Story Self="u2afb" AppliedTOCStyle="n" UserText="true" IsEndnoteStory="false" TrackChanges="false" StoryTitle="$ID/" AppliedNamedGrid="n">
+		<StoryPreference OpticalMarginAlignment="false" OpticalMarginSize="12" FrameType="TextFrameType" StoryOrientation="Vertical" StoryDirection="LeftToRightDirection" />
+		<InCopyExportOption IncludeGraphicProxies="true" IncludeAllResources="false" />
+		<ParagraphStyleRange AppliedParagraphStyle="ParagraphStyle/$ID/NormalParagraphStyle" HyphenationZone="129.25984251968507" RuleAboveLineWeight="3.231496062992127" RuleBelowLineWeight="3.231496062992127" Justification="CenterAlign" SplitColumnInsideGutter="27.360000000000003" ParagraphShadingTint="-1">
+			<Properties>
+				<ParagraphShadingColor type="object">Color/C=0 M=30 Y=0 K=0</ParagraphShadingColor>
+				<Mojikumi type="enumeration">LineEndAllOneHalfEmEnum</Mojikumi>
+			</Properties>
+			<CharacterStyleRange AppliedCharacterStyle="CharacterStyle/$ID/[No character style]" FillColor="Color/C=0 M=30 Y=0 K=0" FontStyle="Normal" PointSize="24" StrokeWeight="3.231496062992127" MiterLimit="18.240000000000002" RubyFontSize="-4.5600000000000005" KentenFontSize="-4.5600000000000005">
+				<Properties>
+					<AppliedFont type="string">思源黑体 CN</AppliedFont>
+				</Properties>
+				<Content><?ACE 18?></Content>
+			</CharacterStyleRange>
+		</ParagraphStyleRange>
+	</Story>
+</idPkg:Story>

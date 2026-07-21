@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<idPkg:Story xmlns:idPkg="http://ns.adobe.com/AdobeInDesign/idml/1.0/packaging" DOMVersion="19.0">
+	<Story Self="u2177" AppliedTOCStyle="n" UserText="true" IsEndnoteStory="false" TrackChanges="false" StoryTitle="$ID/" AppliedNamedGrid="n">
+		<StoryPreference OpticalMarginAlignment="false" OpticalMarginSize="12" FrameType="TextFrameType" StoryOrientation="Vertical" StoryDirection="LeftToRightDirection" />
+		<InCopyExportOption IncludeGraphicProxies="true" IncludeAllResources="false" />
+		<ParagraphStyleRange AppliedParagraphStyle="ParagraphStyle/$ID/NormalParagraphStyle" TreatIdeographicSpaceAsSpace="false" NumberingExpression="^#.^t" BulletsTextAfter="^t">
+			<Properties>
+				<Mojikumi type="enumeration">Nothing</Mojikumi>
+				<BulletsFontStyle type="enumeration">Nothing</BulletsFontStyle>
+			</Properties>
+			<CharacterStyleRange AppliedCharacterStyle="CharacterStyle/$ID/[No character style]" FontStyle="Regular ">
+				<Properties>
+					<AppliedFont type="string">思源黑体 CN</AppliedFont>
+					<RubyFontStyle type="enumeration">Nothing</RubyFontStyle>
+					<KentenFontStyle type="enumeration">Nothing</KentenFontStyle>
+				</Properties>
+			</CharacterStyleRange>
+		</ParagraphStyleRange>
+	</Story>
+</idPkg:Story>

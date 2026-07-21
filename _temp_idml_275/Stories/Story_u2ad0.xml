@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<idPkg:Story xmlns:idPkg="http://ns.adobe.com/AdobeInDesign/idml/1.0/packaging" DOMVersion="19.0">
+	<Story Self="u2ad0" AppliedTOCStyle="n" UserText="true" IsEndnoteStory="false" TrackChanges="false" StoryTitle="$ID/" AppliedNamedGrid="n">
+		<StoryPreference OpticalMarginAlignment="false" OpticalMarginSize="12" FrameType="TextFrameType" StoryOrientation="Vertical" StoryDirection="LeftToRightDirection" />
+		<InCopyExportOption IncludeGraphicProxies="true" IncludeAllResources="false" />
+		<ParagraphStyleRange AppliedParagraphStyle="ParagraphStyle/$ID/NormalParagraphStyle" HyphenationZone="56.69291338582678" RuleAboveLineWeight="1.4173228346456694" RuleBelowLineWeight="1.4173228346456694" TreatIdeographicSpaceAsSpace="false">
+			<Properties>
+				<Mojikumi type="enumeration">Nothing</Mojikumi>
+			</Properties>
+			<CharacterStyleRange AppliedCharacterStyle="CharacterStyle/$ID/[No character style]" FillColor="Color/C=0 M=30 Y=0 K=0" FontStyle="Heavy" PointSize="24" StrokeWeight="1.4173228346456694" RubyFontSize="-2" KentenFontSize="-2">
+				<Properties>
+					<AppliedFont type="string">思源宋体</AppliedFont>
+				</Properties>
+			</CharacterStyleRange>
+		</ParagraphStyleRange>
+	</Story>
+</idPkg:Story>
