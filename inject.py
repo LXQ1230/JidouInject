@@ -148,19 +148,6 @@ def main():
     process(args.idml, args.result, args.output)
 
 
-def process(idml_path, result_path, output_path):
-    """主处理流程"""
-    # Step 1: 从 IDML 提取字符记录
-    stories = extract_from_idml(idml_path)
-    # Step 2: 从句读结果提取字符
-    result_chars = extract_from_result(result_path)
-    # Step 3: 验证并对齐
-    new_stories = validate_and_align(stories, result_chars)
-    # Step 4: 生成新 IDML
-    generate_idml(idml_path, new_stories, output_path)
-    print(f"完成！输出: {output_path}")
-
-
 def extract_from_idml(idml_path: str) -> list[dict]:
     """
     从 IDML 中提取所有文字及其样式信息。
