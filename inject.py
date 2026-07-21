@@ -260,19 +260,8 @@ def _parse_paragraph_style_range(
         else:
             continue
 
-        # 特殊加工指令（如 <?ACE 18?>）
-        if re.match(r'<\?ACE\s', content_text):
-            chars.append({
-                'char': content_text,
-                'is_punct': False,
-                'is_special': True,
-                'style': None,
-                'story_idx': story_idx,
-                'para_idx': para_idx,
-            })
-            continue
-
         # 生成样式模板 — 在完整的 CSR XML 中搜索 Content 元素位置
+        # （对特殊加工指令和普通文字都需生成模板，用于后续重建 IDML）
         full_csr_xml = match.group(0)
         full_content_match = re.search(
             r'<Content>(.*?)</Content>', full_csr_xml, re.DOTALL
@@ -285,6 +274,18 @@ def _parse_paragraph_style_range(
             )
         else:
             style_template = full_csr_xml
+
+        # 特殊加工指令（如 <?ACE 18?>）
+        if re.match(r'<\?ACE\s', content_text):
+            chars.append({
+                'char': content_text,
+                'is_punct': False,
+                'is_special': True,
+                'style': style_template,
+                'story_idx': story_idx,
+                'para_idx': para_idx,
+            })
+            continue
 
         for ch in content_text:
             chars.append({
@@ -476,6 +477,233 @@ def _find_punct_style(all_records: list[dict]) -> str | None:
             return rec['style']
     # 如果找不到，返回 None（后续生成 IDML 时使用默认样式）
     return None
+
+
+def _xml_escape(text: str) -> str:
+    """转义 XML 特殊字符。
+
+    将 & < > " ' 转义为对应的 XML 实体。
+    注意：已在实体中的 & 号（如 &amp;）不会被二次转义，
+    因为我们先替换 & 为 &amp;，后续替换不会匹配新生成的 &。
+    """
+    text = text.replace('&', '&amp;')
+    text = text.replace('<', '&lt;')
+    text = text.replace('>', '&gt;')
+    text = text.replace('"', '&quot;')
+    text = text.replace("'", '&apos;')
+    return text
+
+
+def _rebuild_paragraph_xml(
+    original_psr_xml: str, new_char_records: list[dict]
+) -> str:
+    """用新的字符记录重建 ParagraphStyleRange 的 XML。
+
+    连续的相同样式字符合并为一个 CharacterStyleRange 以减少输出大小。
+    特殊标记（is_special=True）不参与合并，其内容按原样保留不转义。
+    is_punct 记录不与其他样式合并。
+
+    参数:
+        original_psr_xml: 原始 ParagraphStyleRange 的完整 XML 字符串。
+        new_char_records: 该段落的新字符记录列表。
+
+    返回:
+        重建后的 ParagraphStyleRange XML 字符串。
+    """
+    if not new_char_records:
+        return original_psr_xml
+
+    # 提取 ParagraphStyleRange 的前缀（第一个 CharacterStyleRange 之前的内容）
+    first_csr = re.search(r'<CharacterStyleRange', original_psr_xml)
+    if not first_csr:
+        return original_psr_xml
+
+    prefix = original_psr_xml[:first_csr.start()]
+
+    # 提取 ParagraphStyleRange 的后缀（最后一个 CharacterStyleRange 之后的内容）
+    last_csr_end = original_psr_xml.rfind('</CharacterStyleRange>')
+    if last_csr_end >= 0:
+        suffix_start = original_psr_xml.find('>', last_csr_end) + 1
+        suffix = original_psr_xml[suffix_start:]
+    else:
+        suffix = '\n</ParagraphStyleRange>'
+
+    # 生成新的 CharacterStyleRange 元素，合并连续相同样式的字符
+    csr_elements: list[str] = []
+    i = 0
+    while i < len(new_char_records):
+        rec = new_char_records[i]
+
+        if rec.get('is_special', False):
+            # 特殊标记：使用样式模板但内容不转义
+            if rec.get('style'):
+                csr_xml = rec['style'].replace(
+                    '{content}', f'<Content>{rec["char"]}</Content>'
+                )
+                csr_elements.append(csr_xml)
+            else:
+                # 回退：直接保留字符值（不应发生，因为已修复提取逻辑）
+                csr_elements.append(rec['char'])
+            i += 1
+            continue
+
+        # 收集连续相同样式的字符
+        chars_in_group = [rec['char']]
+        j = i + 1
+        while j < len(new_char_records):
+            next_rec = new_char_records[j]
+            if (
+                next_rec.get('is_special', False)
+                or next_rec.get('style') != rec.get('style')
+                or next_rec.get('is_punct') != rec.get('is_punct')
+            ):
+                break
+            chars_in_group.append(next_rec['char'])
+            j += 1
+
+        group_text = ''.join(chars_in_group)
+
+        if rec.get('style'):
+            csr_xml = rec['style'].replace(
+                '{content}', f'<Content>{_xml_escape(group_text)}</Content>'
+            )
+            csr_elements.append(csr_xml)
+
+        i = j
+
+    return prefix + '\n'.join(csr_elements) + suffix
+
+
+def _rebuild_story_xml(header: str, para_xmls: list[str], footer: str) -> str:
+    """用重建的段落 XML 拼接完整的 Story XML。
+
+    参数:
+        header: Story XML 头部（第一个 ParagraphStyleRange 之前的所有内容）。
+        para_xmls: 重建后的各段落 XML 列表。
+        footer: Story XML 尾部（最后一个 ParagraphStyleRange 之后的所有内容）。
+
+    返回:
+        完整的 Story XML 字符串。
+    """
+    return header + '\n'.join(para_xmls) + footer
+
+
+def _write_stories_to_idml(idml_path: str, new_story_xmls: dict[str, str]) -> None:
+    """将修改后的 Story XML 写回 IDML ZIP 文件。
+
+    读取 IDML ZIP 的全部内容到内存，替换指定 Story 的 XML，然后写回。
+    非 Story 文件（图片、字体、designmap 等）原样保留。
+
+    参数:
+        idml_path: IDML 文件路径（已由 shutil.copy2 复制为目标文件）。
+        new_story_xmls: 映射 story_name -> 新的 Story XML 字符串。
+    """
+    # 读取原始 ZIP 全部内容
+    with zipfile.ZipFile(idml_path, 'r') as zf:
+        all_files: dict[str, bytes] = {}
+        for name in zf.namelist():
+            all_files[name] = zf.read(name)
+
+    # 替换修改过的 Story XML
+    for story_name, new_xml in new_story_xmls.items():
+        story_path = f'Stories/Story_{story_name}.xml'
+        if story_path in all_files:
+            all_files[story_path] = new_xml.encode('utf-8')
+        else:
+            print(f"  警告: Story 文件 {story_path} 在 ZIP 中未找到，跳过")
+
+    # 写回 ZIP
+    with zipfile.ZipFile(idml_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for name, data in all_files.items():
+            zf.writestr(name, data)
+
+
+def generate_idml(
+    idml_path: str,
+    stories: list[dict],
+    grouped_records: dict,
+    output_path: str,
+) -> None:
+    """将新字符记录写回 IDML。
+
+    核心流程:
+        1. 复制原始 IDML 到输出路径
+        2. 遍历每个 Story，对每个段落取对应的 grouped_records
+        3. 用新记录重建 ParagraphStyleRange XML
+        4. 拼接完整 Story XML
+        5. 写回 ZIP
+
+    参数:
+        idml_path: 原始 IDML 文件路径。
+        stories: extract_from_idml() 返回的 stories 列表。
+        grouped_records: validate_and_align() 返回的分组记录字典。
+            grouped_records[story_idx][para_idx] = 该段落的新字符记录列表。
+        output_path: 输出 IDML 文件的路径。
+    """
+    # 复制原始 IDML
+    shutil.copy2(idml_path, output_path)
+
+    new_story_xmls: dict[str, str] = {}
+    para_rebuilt_count = 0
+    para_unchanged_count = 0
+
+    for story_idx, story in enumerate(stories):
+        story_xml_parts: list[str] = []
+
+        for para_idx, para in enumerate(story['paragraphs']):
+            para_records = grouped_records.get(story_idx, {}).get(para_idx, [])
+
+            if para_records:
+                new_psr_xml = _rebuild_paragraph_xml(para['raw_xml'], para_records)
+                para_rebuilt_count += 1
+            else:
+                new_psr_xml = para['raw_xml']
+                para_unchanged_count += 1
+
+            story_xml_parts.append(new_psr_xml)
+
+        new_story_xmls[story['name']] = _rebuild_story_xml(
+            story['xml_header'],
+            story_xml_parts,
+            story['xml_footer'],
+        )
+
+    print(f"  重建 {para_rebuilt_count} 个段落，{para_unchanged_count} 个段落保持不变")
+
+    _write_stories_to_idml(output_path, new_story_xmls)
+
+
+def process(idml_path, result_path, output_path):
+    """主处理流程"""
+    print("=" * 60)
+    print("IDML 句读结果回注工具")
+    print("=" * 60)
+
+    # Step 1: 从 IDML 提取
+    print("\n[1/4] 解析 IDML...")
+    stories = extract_from_idml(idml_path)
+    total_chars = sum(
+        len(p['chars']) for s in stories for p in s['paragraphs']
+    )
+    print(f"  提取 {len(stories)} 个 Story, {total_chars} 个字符记录")
+
+    # Step 2: 从句读结果提取
+    print("\n[2/4] 读取句读结果...")
+    result_chars = extract_from_result(result_path)
+    punct_count = sum(1 for c in result_chars if c == '。')
+    print(f"  提取 {len(result_chars)} 个字符（含 {punct_count} 个句号）")
+
+    # Step 3: 验证并对齐
+    print("\n[3/4] 验证并对齐...")
+    grouped_records = validate_and_align(stories, result_chars)
+
+    # Step 4: 生成输出
+    print("\n[4/4] 生成输出 IDML...")
+    generate_idml(idml_path, stories, grouped_records, output_path)
+
+    print(f"\n{'=' * 60}")
+    print(f"完成！输出文件: {output_path}")
+    print(f"{'=' * 60}")
 
 
 if __name__ == "__main__":
