@@ -15,7 +15,119 @@ import argparse
 import shutil
 import tempfile
 import zipfile
+import unicodedata
 from xml.etree import ElementTree as ET
+
+# 旧标点字符集 — 在句读处理前需从原文中清除的所有标点
+_OLD_PUNCT_CHARS: set[str] = {
+    # CJK Symbols and Punctuation (U+3000-U+303F)
+    '、',  # 、 IDEOGRAPHIC COMMA
+    '。',  # 。 IDEOGRAPHIC FULL STOP
+    '〈',  # 〈 LEFT ANGLE BRACKET
+    '〉',  # 〉 RIGHT ANGLE BRACKET
+    '《',  # 《 LEFT DOUBLE ANGLE BRACKET
+    '》',  # 》 RIGHT DOUBLE ANGLE BRACKET
+    '「',  # 「 LEFT CORNER BRACKET
+    '」',  # 」 RIGHT CORNER BRACKET
+    '『',  # 『 LEFT WHITE CORNER BRACKET
+    '』',  # 』 RIGHT WHITE CORNER BRACKET
+    '【',  # 【 LEFT BLACK LENTICULAR BRACKET
+    '】',  # 】 RIGHT BLACK LENTICULAR BRACKET
+    '〔',  # 〔 LEFT TORTOISE SHELL BRACKET
+    '〕',  # 〕 RIGHT TORTOISE SHELL BRACKET
+    '〖',  # 〖 LEFT WHITE LENTICULAR BRACKET
+    '〗',  # 〗 RIGHT WHITE LENTICULAR BRACKET
+    '〜',  # 〜 WAVE DASH
+    '〝',  # 〝 REVERSED DOUBLE PRIME QUOTATION MARK
+    '〞',  # 〞 DOUBLE PRIME QUOTATION MARK
+    '〰',  # 〰 WAVY DASH
+    '〽',  # 〽 PART ALTERNATION MARK
+    # Fullwidth Forms (U+FF00-U+FFEF) — punctuation subset
+    '！',  # ！ FULLWIDTH EXCLAMATION MARK
+    '＂',  # ＂ FULLWIDTH QUOTATION MARK
+    '＇',  # ＇ FULLWIDTH APOSTROPHE
+    '（',  # （ FULLWIDTH LEFT PARENTHESIS
+    '）',  # ） FULLWIDTH RIGHT PARENTHESIS
+    '，',  # ， FULLWIDTH COMMA
+    '．',  # ． FULLWIDTH FULL STOP
+    '：',  # ： FULLWIDTH COLON
+    '；',  # ； FULLWIDTH SEMICOLON
+    '？',  # ？ FULLWIDTH QUESTION MARK
+    '［',  # ［ FULLWIDTH LEFT SQUARE BRACKET
+    '］',  # ］ FULLWIDTH RIGHT SQUARE BRACKET
+    '｛',  # ｛ FULLWIDTH LEFT CURLY BRACKET
+    '｝',  # ｝ FULLWIDTH RIGHT CURLY BRACKET
+    '～',  # ～ FULLWIDTH TILDE
+    # CJK Compatibility Forms (U+FE30-U+FE4F)
+    '︰',  # ︰ PRESENTATION FORM FOR VERTICAL TWO DOT LEADER
+    '︱',  # ︱ PRESENTATION FORM FOR VERTICAL EM DASH
+    '︳',  # ︳ PRESENTATION FORM FOR VERTICAL LOW LINE
+    '︴',  # ︴ PRESENTATION FORM FOR VERTICAL WAVY LOW LINE
+    '︵',  # ︵ PRESENTATION FORM FOR VERTICAL LEFT PARENTHESIS
+    '︶',  # ︶ PRESENTATION FORM FOR VERTICAL RIGHT PARENTHESIS
+    '︷',  # ︷ PRESENTATION FORM FOR VERTICAL LEFT CURLY BRACKET
+    '︸',  # ︸ PRESENTATION FORM FOR VERTICAL RIGHT CURLY BRACKET
+    '︹',  # ︹ PRESENTATION FORM FOR VERTICAL LEFT TORTOISE SHELL BRACKET
+    '︺',  # ︺ PRESENTATION FORM FOR VERTICAL RIGHT TORTOISE SHELL BRACKET
+    '︻',  # ︻ PRESENTATION FORM FOR VERTICAL LEFT BLACK LENTICULAR BRACKET
+    '︼',  # ︼ PRESENTATION FORM FOR VERTICAL RIGHT BLACK LENTICULAR BRACKET
+    '︽',  # ︽ PRESENTATION FORM FOR VERTICAL LEFT DOUBLE ANGLE BRACKET
+    '︾',  # ︾ PRESENTATION FORM FOR VERTICAL RIGHT DOUBLE ANGLE BRACKET
+    '︿',  # ︿ PRESENTATION FORM FOR VERTICAL LEFT ANGLE BRACKET
+    '﹀',  # ﹀ PRESENTATION FORM FOR VERTICAL RIGHT ANGLE BRACKET
+    '﹁',  # ﹁ PRESENTATION FORM FOR VERTICAL LEFT CORNER BRACKET
+    '﹂',  # ﹂ PRESENTATION FORM FOR VERTICAL RIGHT CORNER BRACKET
+    '﹃',  # ﹃ PRESENTATION FORM FOR VERTICAL LEFT WHITE CORNER BRACKET
+    '﹄',  # ﹄ PRESENTATION FORM FOR VERTICAL RIGHT WHITE CORNER BRACKET
+    '﹏',  # ﹏ WAVY LOW LINE
+    # General punctuation
+    '‘',  # ' LEFT SINGLE QUOTATION MARK
+    '’',  # ' RIGHT SINGLE QUOTATION MARK
+    '“',  # " LEFT DOUBLE QUOTATION MARK
+    '”',  # " RIGHT DOUBLE QUOTATION MARK
+    '…',  # … HORIZONTAL ELLIPSIS
+    '‥',  # ‥ TWO DOT LEADER
+    # ASCII punctuation (English)
+    ',', '.', '!', '?', ':', ';', '"', "'", '(', ')', '[', ']', '{', '}', '<', '>',
+    '-', '—', '–', '/', '\\', '|', '@', '#', '$', '%', '^', '&', '*', '+', '=', '`',
+    '~',
+}
+
+
+def _is_old_punct(ch: str) -> bool:
+    """判断字符是否为旧标点，即句读处理中需要从原文清除的标点符号。"""
+    if len(ch) != 1:
+        return False
+    return ch in _OLD_PUNCT_CHARS
+
+
+def _is_unicode_whitespace(ch: str) -> bool:
+    """判断字符是否为 Unicode 空白/控制字符（IDML 中的布局空白）。
+
+    U+3000（全角空格）保留，因为它在佛经偈颂中用于分字。
+    """
+    if len(ch) != 1:
+        return False
+    cp = ord(ch)
+    # U+3000 ideographic space is CONTENT (used in verses), not whitespace to strip
+    if cp == 0x3000:
+        return False
+    # ASCII whitespace
+    if ch in '\n\r\t ':
+        return True
+    # Unicode line/paragraph separators
+    if cp in (0x2028, 0x2029):
+        return True
+    # Unicode whitespace category check
+    try:
+        cat = unicodedata.category(ch)
+        # Zs = space separator, Zl = line separator, Zp = paragraph separator
+        # Cc = control characters
+        if cat in ('Zs', 'Zl', 'Zp', 'Cc'):
+            return True
+    except ValueError:
+        pass
+    return False
 
 
 def main():
@@ -177,12 +289,16 @@ def _parse_paragraph_style_range(
         for ch in content_text:
             chars.append({
                 'char': ch,
-                'is_punct': is_punct,
+                'is_punct': is_punct or _is_old_punct(ch),
                 'is_special': False,
                 'style': style_template,
                 'story_idx': story_idx,
                 'para_idx': para_idx,
             })
+
+    # 去除段落末尾的全角空格（IDML 布局留白，TXT 导出时会忽略）
+    while chars and chars[-1]['char'] == '　':
+        chars.pop()
 
     return chars
 
@@ -227,6 +343,139 @@ def extract_from_result(md_path: str) -> list[str]:
     chars = [ch for ch in body if ch not in '\n\r\t ']
 
     return chars
+
+
+def validate_and_align(stories: list[dict], result_chars: list[str]) -> dict:
+    """
+    验证 IDML 净文字与句读结果净文字一致，然后执行字符级对齐。
+
+    核心逻辑：
+    - IDML 的非标点、非特殊标记字符在句读结果中必有对应
+    - 句读结果中新增的「。」插入在对应位置，归属上一字符的段落
+    - 对齐后的每个 new_record 都标记了所属的 (story_idx, para_idx)
+
+    返回: grouped_records，结构为 {story_idx: {para_idx: [records]}}
+    """
+    # 扁平化所有 IDML 字符记录
+    # 跳过内容过少的故事（装饰性元素，如页眉标题、译者信息等）
+    # 这些装饰故事的内容不在句读结果中，不应参与对齐
+    _MIN_CLEAN_CHARS_PER_STORY = 50
+    all_idml_records: list[dict] = []
+    for story in stories:
+        # 检查此 story 是否有足够的正文内容
+        story_clean_count = sum(
+            1 for para in story['paragraphs']
+            for rec in para['chars']
+            if not rec['is_punct'] and not rec.get('is_special', False)
+            and not _is_unicode_whitespace(rec['char'])
+        )
+        if story_clean_count < _MIN_CLEAN_CHARS_PER_STORY:
+            continue
+        for para in story['paragraphs']:
+            for rec in para['chars']:
+                all_idml_records.append(rec)
+
+    # 提取 IDML 净文字（跳过旧标点、特殊标记如 <?ACE 18?>、以及 Unicode 布局空白）
+    idml_clean_indices: list[int] = []
+    for i, rec in enumerate(all_idml_records):
+        ch = rec['char']
+        if rec['is_punct'] or rec.get('is_special', False):
+            continue
+        if _is_unicode_whitespace(ch):
+            continue
+        idml_clean_indices.append(i)
+
+    idml_clean_chars = [all_idml_records[i]['char'] for i in idml_clean_indices]
+    result_clean_chars = [c for c in result_chars if c != '。']
+
+    # 逐字比对验证
+    idml_clean_str = ''.join(idml_clean_chars)
+    result_clean_str = ''.join(result_clean_chars)
+
+    if idml_clean_str != result_clean_str:
+        # 找到第一个差异位置
+        min_len = min(len(idml_clean_str), len(result_clean_str))
+        for i in range(min_len):
+            a = idml_clean_str[i]
+            b = result_clean_str[i]
+            if a != b:
+                ctx = max(0, i - 20)
+                raise ValueError(
+                    f"字数验证失败！\n"
+                    f"IDML 净文字数: {len(idml_clean_str)}\n"
+                    f"句读结果净文字数: {len(result_clean_str)}\n"
+                    f"第一个差异在位置 {i}:\n"
+                    f"  IDML: ...{idml_clean_str[ctx:i+20]}...\n"
+                    f"  结果: ...{result_clean_str[ctx:i+20]}...\n"
+                    f"  IDML 字符: '{a}' (U+{ord(a):04X})\n"
+                    f"  结果字符: '{b}' (U+{ord(b):04X})"
+                )
+        raise ValueError(
+            f"字数验证失败！IDML: {len(idml_clean_str)} 字, "
+            f"结果: {len(result_clean_str)} 字"
+        )
+
+    print(f"验证通过: {len(idml_clean_str)} 字一致")
+
+    # 对齐: 遍历句读结果，每个字符映射到对应的 IDML 段落和样式
+    clean_idx = 0          # 在 idml_clean_indices 中的位置
+    last_para = None       # 上一个字符的 (story_idx, para_idx)
+    new_records: list[dict] = []
+    punct_style = _find_punct_style(all_idml_records)
+
+    for ch in result_chars:
+        if ch == '。':
+            # 新增句号：归属到上一个字符的段落
+            story_idx, para_idx = last_para if last_para else (0, 0)
+            new_records.append({
+                'char': '。',
+                'is_punct': True,
+                'is_special': False,
+                'style': punct_style,
+                'story_idx': story_idx,
+                'para_idx': para_idx,
+            })
+        else:
+            # 普通文字：映射到对应 IDML 字符的样式和段落
+            target_idx = idml_clean_indices[clean_idx]
+            orig_rec = all_idml_records[target_idx]
+
+            new_records.append({
+                'char': ch,
+                'is_punct': False,
+                'is_special': False,
+                'style': orig_rec['style'],
+                'story_idx': orig_rec['story_idx'],
+                'para_idx': orig_rec['para_idx'],
+            })
+
+            last_para = (orig_rec['story_idx'], orig_rec['para_idx'])
+            clean_idx += 1
+
+    # 按 (story_idx, para_idx) 分组
+    grouped: dict = {}  # {story_idx: {para_idx: [records]}}
+    for rec in new_records:
+        si = rec['story_idx']
+        pi = rec['para_idx']
+        if si not in grouped:
+            grouped[si] = {}
+        if pi not in grouped[si]:
+            grouped[si][pi] = []
+        grouped[si][pi].append(rec)
+
+    punct_count = sum(1 for r in new_records if r['is_punct'])
+    print(f"对齐完成: {len(new_records)} 个字符（含 {punct_count} 个句号）")
+
+    return grouped
+
+
+def _find_punct_style(all_records: list[dict]) -> str | None:
+    """查找 IDML 中已有的句号样式模板"""
+    for rec in all_records:
+        if rec['is_punct'] and rec.get('style'):
+            return rec['style']
+    # 如果找不到，返回 None（后续生成 IDML 时使用默认样式）
+    return None
 
 
 if __name__ == "__main__":
