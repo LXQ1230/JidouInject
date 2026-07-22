@@ -980,6 +980,39 @@ def generate_idml(
     _write_stories_to_idml(output_path, new_story_xmls)
 
 
+def _verify_br_count(input_path: str, output_path: str) -> None:
+    """验证输出 IDML 的 Br 数量是否合理。
+
+    输入中被清空的旧句号 CSR 中的 Br 应该消失，其余 Br 应该保留。
+    如果差异较大，说明重建过程有 Br 丢失或多余。
+    """
+    def _count_br(xml: str) -> int:
+        return xml.count('<Br />') + xml.count('<Br/>')
+
+    with zipfile.ZipFile(input_path, 'r') as zf:
+        in_xml = zf.read('Stories/Story_u15de.xml').decode('utf-8')
+    with zipfile.ZipFile(output_path, 'r') as zf:
+        out_xml = zf.read('Stories/Story_u15de.xml').decode('utf-8')
+
+    # 输入中旧句号 CSR 的 Br 数（这些会被清除）
+    csr_pattern = r'<CharacterStyleRange([^>]*?CharacterStyle/句号[^>]*?)>.*?</CharacterStyleRange>'
+    br_in_old_punct = sum(
+        _count_br(m.group(0))
+        for m in re.finditer(csr_pattern, in_xml, re.DOTALL)
+    )
+
+    in_br = _count_br(in_xml)
+    out_br = _count_br(out_xml)
+    expected_br = in_br - br_in_old_punct
+
+    if out_br == expected_br:
+        print(f"  Br 检查通过: 输入 {in_br} → 输出 {out_br}（清除旧句号 Br {br_in_old_punct}）")
+    else:
+        diff = out_br - expected_br
+        print(f"  Br 检查警告: 预期 {expected_br}（输入 {in_br} - 旧句号 {br_in_old_punct}），"
+              f"实际 {out_br}（差异 {diff:+d}）")
+
+
 def _verify_output(output_path: str, expected_chars: list[str]) -> None:
     """输出自检：从生成的 IDML 重新提取字符序列并与输入比对。
 
@@ -1078,9 +1111,9 @@ def process(idml_path, result_path, output_path):
     print("\n[4/5] 生成输出 IDML...")
     generate_idml(idml_path, stories, grouped_records, output_path)
 
-    # Step 5: 输出自检 — 从生成的 IDML 重新提取并与输入比对
-    # 这是防止写入过程引入数据丢失的最后一道防线
+    # Step 5: Br 一致性检查 — 输出 IDML 的 Br 数是否合理
     print("\n[5/5] 验证输出 IDML...")
+    _verify_br_count(idml_path, output_path)
     _verify_output(output_path, result_chars)
 
     print(f"\n{'=' * 60}")
