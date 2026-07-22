@@ -712,9 +712,35 @@ def _rebuild_paragraph_xml(
         csr_prefix = csr_xml[:content_start]
         csr_suffix = csr_xml[content_end:]
 
+        orig_contents = cdata.get('contents', [])
+        is_multi_content = len(orig_contents) > 1
         has_punct_inside = any(p for p, _ in segments)
+
+        if is_multi_content:
+            # 多 Content CSR：按原 Content 数量比例分配文字（含句号）
+            orig_lens = [len(c) for c in orig_contents]
+            total_orig = sum(orig_lens)
+            new_text = ''.join(t for _, t in segments)
+            if total_orig > 0:
+                parts_xml = csr_xml
+                pos = 0
+                for oi, ol in enumerate(orig_lens):
+                    if oi == len(orig_contents) - 1:
+                        share = len(new_text) - pos
+                    else:
+                        share = max(1, len(new_text) * ol // total_orig)
+                    part_text = new_text[pos:pos + share]
+                    pos += share
+                    old_ctag = f'<Content>{orig_contents[oi]}</Content>'
+                    new_ctag = f'<Content>{_xml_escape(part_text)}</Content>'
+                    parts_xml = parts_xml.replace(old_ctag, new_ctag, 1)
+                csr_replacements[ci] = parts_xml
+            else:
+                csr_replacements[ci] = csr_xml
+            continue
+
         if not has_punct_inside:
-            # 无拆分：全部文字合并，保留完整 CSR 结构
+            # 单 Content、无拆分：全部文字合并
             text = ''.join(t for _, t in segments)
             csr_replacements[ci] = (
                 csr_prefix
