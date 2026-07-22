@@ -625,90 +625,110 @@ def _rebuild_paragraph_xml(
     original_psr_xml: str, new_char_records: list[dict],
     global_punct_template: str | None = None,
 ) -> str:
-    """用槽位追踪的方式重建 ParagraphStyleRange XML。
+    """用槽位追踪 + CSR 拆分的方式重建 ParagraphStyleRange XML。
 
-    保留原始 PSR XML 的全部结构，将文字填入原文字 CSR、
-    句号填入原句号 CSR（CharacterStyle/句号），互不混合。
+    当句读结果要求在同一个 CSR 内的两个字之间插入句号时，
+    自动将原 CSR 拆分为多段，句号独立插入其间。
     """
     if not new_char_records:
         return original_psr_xml
 
-    # 1. 分离文字记录和句号记录
-    text_records = [r for r in new_char_records
-                    if r['csr_idx'] >= 0 and not r.get('is_special', False)]
-    punct_records = [r for r in new_char_records
-                     if r['csr_idx'] == -1 and r.get('is_punct', False)]
+    # 1. 收集所有有效记录（文字 + 句号），排除空白标记
+    all_records = [r for r in new_char_records
+                   if not r.get('is_special', False)]
 
-    # 2. 按 (csr_idx, content_slot) 收集文字文本
-    slot_texts: dict[tuple, str] = {}
-    for rec in text_records:
-        key = (rec['csr_idx'], rec['content_slot'])
-        slot_texts[key] = slot_texts.get(key, '') + rec['char']
-
-    # 3. 扫描原始 PSR XML
+    # 2. 扫描原始 PSR XML
     csr_pattern = r'<CharacterStyleRange([^>]*?)(?:>(.*?)</CharacterStyleRange>|/>)'
-    slot_order: list[tuple] = []
-    punct_csr_indices: list[int] = []
+    csr_list: list[dict] = []  # [{csr_idx, match_obj, is_punct, contents}]
     punct_template: str | None = None
-
     csr_idx = 0
-    for csr_match in re.finditer(csr_pattern, original_psr_xml, re.DOTALL):
-        inner = csr_match.group(2) or ''
-        attrs = csr_match.group(1)
-        slot_contents = re.findall(
-            r'<Content>(.*?)</Content>', inner, re.DOTALL
-        )
-        is_punct_csr = 'CharacterStyle/句号' in attrs
-        for slot_idx in range(len(slot_contents)):
-            slot_order.append((csr_idx, slot_idx))
-        if is_punct_csr and len(slot_contents) > 0:
-            punct_csr_indices.append(csr_idx)
-            if punct_template is None:
-                punct_template = csr_match.group(0)
+    for m in re.finditer(csr_pattern, original_psr_xml, re.DOTALL):
+        inner = m.group(2) or ''
+        csr_list.append({
+            'idx': csr_idx,
+            'match': m,
+            'is_punct': 'CharacterStyle/句号' in m.group(1),
+            'contents': re.findall(r'<Content>(.*?)</Content>', inner, re.DOTALL),
+        })
+        if csr_list[-1]['is_punct'] and csr_list[-1]['contents'] and punct_template is None:
+            punct_template = m.group(0)
         csr_idx += 1
 
-    # 如果当前段落没有句号 CSR 模板，使用全局模板
     if punct_template is None:
         punct_template = global_punct_template
 
-    # 4. 清空所有旧句号 CSR 的 Content
-    for ci in punct_csr_indices:
-        for si in range(sum(1 for (c, s) in slot_order if c == ci)):
-            slot_texts[(ci, si)] = ''
+    # 3. 将记录按 csr_idx 分组（含句号：after_csr 指向它跟随的文字 CSR）
+    # csr_texts: {csr_idx: [(is_punct, text), ...]} — 保持原始顺序
+    csr_segments: dict[int, list[tuple[bool, str]]] = {}
+    for rec in all_records:
+        if rec.get('is_punct', False):
+            ci = rec.get('after_csr', -1)
+        else:
+            ci = rec['csr_idx']
+        if ci < 0:
+            continue
+        is_p = rec.get('is_punct', False)
+        csr_segments.setdefault(ci, []).append((is_p, rec['char']))
 
-    # 5. 替换所有 Content 文本
-    content_matches = list(
-        re.finditer(r'<Content>(.*?)</Content>', original_psr_xml, re.DOTALL)
-    )
+    # 4. 生成 CSR 级别的替换内容
+    # csr_replacements: {csr_idx: replacement_xml_string}
+    csr_replacements: dict[int, str] = {}
+    for ci, cdata in enumerate(csr_list):
+        segments = csr_segments.get(ci, [])
+        if not segments:
+            if cdata['is_punct']:
+                csr_replacements[ci] = ''  # 旧句号 CSR 无内容 → 标记删除
+            continue
+
+        if cdata['is_punct']:
+            # 旧句号 CSR：句读结果有分配句号过来则填充，否则删除
+            has_punct = any(p for p, _ in segments)
+            if not has_punct:
+                csr_replacements[ci] = ''
+            elif punct_template:
+                csr_replacements[ci] = punct_template
+            continue
+
+        # 文字 CSR：检查是否需要拆分
+        match = cdata['match']
+        csr_xml = match.group(0)
+        content_start = csr_xml.find('<Content>')
+        content_end = csr_xml.rfind('</Content>') + len('</Content>')
+        csr_prefix = csr_xml[:content_start]
+        csr_suffix = csr_xml[content_end:]
+
+        has_punct_inside = any(p for p, _ in segments)
+        if not has_punct_inside:
+            # 无拆分：全部文字合并，保留完整 CSR 结构
+            text = ''.join(t for _, t in segments)
+            csr_replacements[ci] = (
+                csr_prefix
+                + f'<Content>{_xml_escape(text)}</Content>'
+                + csr_suffix
+            )
+        else:
+            # 需要拆分：生成多个 CSR（文字 + 句号交错）
+            parts = []
+            for is_p, text in segments:
+                if is_p and punct_template:
+                    parts.append(punct_template)
+                else:
+                    parts.append(
+                        csr_prefix
+                        + f'<Content>{_xml_escape(text)}</Content>'
+                        + csr_suffix
+                    )
+            csr_replacements[ci] = ''.join(parts)
+
+    # 5. 应用替换：从后往前
     result = original_psr_xml
-    for i in range(len(content_matches) - 1, -1, -1):
-        old_match = content_matches[i]
-        key = slot_order[i] if i < len(slot_order) else None
-        new_text = slot_texts.get(key, '') if key else ''
-        new_tag = f'<Content>{_xml_escape(new_text)}</Content>'
-        result = result[:old_match.start()] + new_tag + result[old_match.end():]
-
-    # 6. 删除旧句号 CSR 后重新计算 after_csr 偏移，再插入新句号
-    result = _remove_empty_punct_csrs(result, csr_pattern)
-    if punct_records:
-        tmpl = punct_template
-        if tmpl is None or '。</Content>' not in tmpl:
-            tmpl = global_punct_template
-        if tmpl is not None:
-            # 调整 after_csr：旧句号 CSR 被删除后，csr_idx 发生偏移
-            adjusted_records = []
-            for prec in punct_records:
-                old_csr = prec.get('after_csr', -1)
-                if old_csr < 0:
-                    adjusted_records.append(prec)
-                    continue
-                # 计算在 old_csr 之前被删除的旧句号 CSR 数量
-                deleted_before = sum(
-                    1 for ci in punct_csr_indices if ci < old_csr
-                )
-                new_csr = old_csr - deleted_before
-                adjusted_records.append({**prec, 'after_csr': new_csr})
-            result = _insert_punct_csrs(result, adjusted_records, tmpl)
+    for ci in range(len(csr_list) - 1, -1, -1):
+        cdata = csr_list[ci]
+        if ci not in csr_replacements:
+            continue
+        repl = csr_replacements[ci]
+        match = cdata['match']
+        result = result[:match.start()] + repl + result[match.end():]
 
     return result
 
