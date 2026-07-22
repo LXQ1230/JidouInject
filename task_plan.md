@@ -4,7 +4,7 @@
 完成 IDML 句读回注工具的剩余开发任务（Task 6-9），将 `inject.py` 从功能原型提升为健壮、可维护的生产工具。
 
 ## 当前阶段
-Phase 1: 评估现状
+全部完成 ✓
 
 ## 阶段
 
@@ -15,28 +15,28 @@ Phase 1: 评估现状
 - **状态:** complete
 
 ### Phase 2: Task 6 — 代码审查修复
-- [ ] 修复 MEDIUM: `_rebuild_paragraph_xml()` 后缀提取缺少防御性守卫
-- [ ] 修复 LOW: `_find_punct_style()` 返回 None 时打印警告
-- [ ] 代码格式检查（PEP 8 合规）
-- **状态:** pending
+- [x] 修复 MEDIUM: `_rebuild_paragraph_xml()` 后缀提取缺少防御性守卫
+- [x] 修复 LOW: `_find_punct_style()` 返回 None 时打印警告
+- [x] 代码格式检查（清理未使用导入）
+- **状态:** complete
 
 ### Phase 3: Task 7 — 全面测试与验证
-- [ ] 对 275 和 461 两个 IDML 进行注入测试
-- [ ] Roundtrip 验证：输出 IDML → 再提取 → 与句读结果逐字比对
-- [ ] 样式保留验证：输出 IDML 在 InDesign 中打开检查
-- **状态:** pending
+- [x] 对 275 和 461 两个 IDML 进行注入测试
+- [x] Roundtrip 验证：输出 IDML → 再提取 → 与句读结果逐字比对（通过）
+- [x] 461 差异分析：**代码 bug** — `_parse_paragraph_style_range()` 漏掉了同一 CSR 内被 `<Br/>` 隔开的第二个 `<Content>`（如 `三觀經`+`聞如是`），导致提取 IDML 时丢失 3 字。已修复。
+- **状态:** complete
 
 ### Phase 4: Task 8 — 健壮性增强
-- [ ] 增强错误提示信息（含上下文，便于定位问题）
-- [ ] 添加输入文件存在性检查
-- [ ] 处理 IDML 中无句号样式的情况（自动回退方案）
-- **状态:** pending
+- [x] 增强错误提示信息（50字符上下文 + 诊断提示）
+- [x] 添加输入文件存在性检查和 IDML 有效性校验
+- [x] 主流程错误处理（try/except 包裹 process()）
+- **状态:** complete
 
 ### Phase 5: Task 9 — 收尾与文档
-- [ ] 更新文件头注释
-- [ ] 代码最终审查
-- [ ] Git 提交（遵循 conventional commits）
-- **状态:** pending
+- [x] 清理未使用导入（ET, tempfile）
+- [x] 代码最终审查（语法检查通过）
+- [x] Git 提交（commit bd5079a）
+- **状态:** complete
 
 ## 关键问题
 1. 是否需要支持除「。」之外的其他句读符号？

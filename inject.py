@@ -266,23 +266,27 @@ def _parse_paragraph_style_range(
 
         is_punct = 'CharacterStyle/句号' in attrs_str or 'CharacterStyle/句号' in inner
 
-        content_match = re.search(r'<Content>(.*?)</Content>', inner, re.DOTALL)
-        if content_match:
-            content_text = content_match.group(1)
-        else:
-            continue
-
-        # 生成样式模板 — 在完整的 CSR XML 中搜索 Content 元素位置
-        # （对特殊加工指令和普通文字都需生成模板，用于后续重建 IDML）
-        full_csr_xml = match.group(0)
-        full_content_match = re.search(
-            r'<Content>(.*?)</Content>', full_csr_xml, re.DOTALL
+        # 查找 ALL Content 元素（处理同一 CSR 内有多个 <Content> 被 <Br/> 等隔开的情况）
+        content_matches = list(
+            re.finditer(r'<Content>(.*?)</Content>', inner, re.DOTALL)
         )
-        if full_content_match:
+        if not content_matches:
+            continue
+        content_text = ''.join(m.group(1) for m in content_matches)
+
+        # 生成样式模板 — 覆盖从第一个 Content 到最后一个 Content 的全部范围
+        # 将多 Content + 中间元素（如 <Br/>）整体替换为 {content} 占位符
+        full_csr_xml = match.group(0)
+        full_content_matches = list(
+            re.finditer(r'<Content>(.*?)</Content>', full_csr_xml, re.DOTALL)
+        )
+        if full_content_matches:
+            first_start = full_content_matches[0].start()
+            last_end = full_content_matches[-1].end()
             style_template = (
-                full_csr_xml[:full_content_match.start()]
+                full_csr_xml[:first_start]
                 + '{content}'
-                + full_csr_xml[full_content_match.end():]
+                + full_csr_xml[last_end:]
             )
         else:
             style_template = full_csr_xml
