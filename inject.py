@@ -549,8 +549,9 @@ def validate_and_align(stories: list[dict], result_chars: list[str]) -> dict:
                 'is_special': False,
                 'story_idx': si,
                 'para_idx': pi,
-                'csr_idx': ci,
-                'content_slot': sl,
+                'csr_idx': -1,       # 标记：重建时插入旧句号槽位或末尾
+                'content_slot': -1,
+                'after_csr': ci,     # 插入在此 csr_idx 之后
             })
         elif _is_ws_for_compare(ch):
             pass
@@ -618,45 +619,67 @@ def _xml_escape(text: str) -> str:
 
 
 def _rebuild_paragraph_xml(
-    original_psr_xml: str, new_char_records: list[dict]
+    original_psr_xml: str, new_char_records: list[dict],
+    global_punct_template: str | None = None,
 ) -> str:
     """用槽位追踪的方式重建 ParagraphStyleRange XML。
 
-    保留原始 PSR XML 的全部结构（Br、Properties 等），
-    仅替换各 <Content> 标签内的文本。
+    保留原始 PSR XML 的全部结构，将文字填入原文字 CSR、
+    句号填入原句号 CSR（CharacterStyle/句号），互不混合。
     """
     if not new_char_records:
         return original_psr_xml
 
-    # 1. 按 (csr_idx, content_slot) 收集文本
+    # 1. 分离文字记录和句号记录
+    text_records = [r for r in new_char_records
+                    if r['csr_idx'] >= 0 and not r.get('is_special', False)]
+    punct_records = [r for r in new_char_records
+                     if r['csr_idx'] == -1 and r.get('is_punct', False)]
+
+    # 2. 按 (csr_idx, content_slot) 收集文字文本
     slot_texts: dict[tuple, str] = {}
-    for rec in new_char_records:
-        if rec.get('is_special', False):
-            continue
+    for rec in text_records:
         key = (rec['csr_idx'], rec['content_slot'])
         slot_texts[key] = slot_texts.get(key, '') + rec['char']
 
-    # 2. 扫描原始 PSR XML，按 CSR 顺序确定 Content 槽位顺序
+    # 3. 扫描原始 PSR XML
     csr_pattern = r'<CharacterStyleRange([^>]*?)(?:>(.*?)</CharacterStyleRange>|/>)'
-    slot_order: list[tuple] = []  # [(csr_idx, slot_idx), ...]
+    slot_order: list[tuple] = []
+    punct_csr_indices: list[int] = []
+    punct_template: str | None = None
+
     csr_idx = 0
     for csr_match in re.finditer(csr_pattern, original_psr_xml, re.DOTALL):
         inner = csr_match.group(2) or ''
+        attrs = csr_match.group(1)
         slot_contents = re.findall(
             r'<Content>(.*?)</Content>', inner, re.DOTALL
         )
+        is_punct_csr = 'CharacterStyle/句号' in attrs
         for slot_idx in range(len(slot_contents)):
             slot_order.append((csr_idx, slot_idx))
+        if is_punct_csr and len(slot_contents) > 0:
+            punct_csr_indices.append(csr_idx)
+            if punct_template is None:
+                punct_template = csr_match.group(0)
         csr_idx += 1
 
-    # 3. 逐个替换 Content 文本
-    # 使用位置偏移量方案：先收集所有替换（start, end, new_tag），
-    # 再从后往前执行替换。这样前面的替换不会影响后面替换的位置。
+    # 如果当前段落没有句号 CSR 模板，使用全局模板
+    if punct_template is None:
+        punct_template = global_punct_template
+
+    # 4. 清空所有旧句号 CSR（原 。位置），新句号将插入到正确位置
+    for ci in punct_csr_indices:
+        for si in range(sum(1 for (c, s) in slot_order if c == ci)):
+            key = (ci, si)
+            if key not in slot_texts or slot_texts[key] is None:
+                slot_texts[key] = ''
+
+    # 5. 替换所有 Content 文本（同前，从后往前）
     content_matches = list(
         re.finditer(r'<Content>(.*?)</Content>', original_psr_xml, re.DOTALL)
     )
-
-    replacements = []  # [(start_pos, end_pos, new_tag), ...]
+    replacements = []
     for i, old_match in enumerate(content_matches):
         if i < len(slot_order):
             key = slot_order[i]
@@ -666,10 +689,70 @@ def _rebuild_paragraph_xml(
         new_tag = f'<Content>{_xml_escape(new_text)}</Content>'
         replacements.append((old_match.start(), old_match.end(), new_tag))
 
-    # 从后往前替换，位置不受前面替换影响
     result = original_psr_xml
     for start, end, new_tag in reversed(replacements):
         result = result[:start] + new_tag + result[end:]
+
+    # 6. 将新句号插入到对应 text CSR 之后
+    if punct_records:
+        tmpl = punct_template
+        if tmpl is None or '。</Content>' not in tmpl:
+            tmpl = global_punct_template
+        if tmpl is not None:
+            result = _insert_punct_csrs(result, punct_records, tmpl)
+
+    return result
+
+
+def _insert_punct_csrs(
+    xml: str, punct_records: list[dict], template: str
+) -> str:
+    """将句号 CSR 插入到 XML 中对应 text CSR 之后。"""
+    # 按 after_csr 分组，从后往前插入，保持位置稳定
+    punct_after: dict[int, list[dict]] = {}
+    for prec in punct_records:
+        ci = prec.get('after_csr', -1)
+        if ci < 0:
+            continue
+        punct_after.setdefault(ci, []).append(prec)
+
+    if not punct_after:
+        return xml
+
+    # 找到每个 csr_idx 对应的 </CharacterStyleRange> 位置
+    csr_pattern = r'<CharacterStyleRange([^>]*?)(?:>(.*?)</CharacterStyleRange>|/>)'
+    csr_closes = []  # [(csr_idx, close_pos), ...]
+    csr_idx = 0
+    for csr_match in re.finditer(csr_pattern, xml, re.DOTALL):
+        attrs = csr_match.group(1)
+        is_punct_csr = 'CharacterStyle/句号' in attrs
+        end_pos = csr_match.end()
+        csr_closes.append((csr_idx, end_pos, is_punct_csr))
+        csr_idx += 1
+
+    # 从后往前插入
+    result = xml
+    for ci in sorted(punct_after.keys(), reverse=True):
+        # 找到 csr_idx=ci 的 CSR 结束位置。跳过旧句号 CSR（已被清空）
+        close_pos = None
+        for idx, pos, is_punct in csr_closes:
+            if idx == ci:
+                close_pos = pos
+                break
+        if close_pos is None:
+            continue
+        # 在 close_pos 处插入该 csr 后跟的所有句号 CSR
+        tail = ''.join(template for _ in punct_after[ci])
+        result = result[:close_pos] + tail + result[close_pos:]
+
+    # 处理 after_csr=-1 的句号（应该没有），放末尾
+    overflow = [p for p in punct_records if p.get('after_csr', -1) < 0]
+    if overflow:
+        tail = ''.join(template for _ in overflow)
+        last_close = result.rfind('</CharacterStyleRange>')
+        if last_close >= 0:
+            insert_pos = result.find('>', last_close) + 1
+            result = result[:insert_pos] + tail + result[insert_pos:]
 
     return result
 
@@ -743,6 +826,21 @@ def generate_idml(
     # 复制原始 IDML
     shutil.copy2(idml_path, output_path)
 
+    # 查找全局句号 CSR 模板（用于没有原句号 CSR 的段落）
+    global_punct_template: str | None = None
+    for story in stories:
+        for para in story['paragraphs']:
+            csr_pattern = (
+                r'<CharacterStyleRange([^>]*?CharacterStyle/句号[^>]*?)>'
+                r'.*?</CharacterStyleRange>'
+            )
+            tm = re.search(csr_pattern, para['raw_xml'], re.DOTALL)
+            if tm:
+                global_punct_template = tm.group(0)
+                break
+        if global_punct_template:
+            break
+
     new_story_xmls: dict[str, str] = {}
     para_rebuilt_count = 0
     para_unchanged_count = 0
@@ -754,7 +852,9 @@ def generate_idml(
             para_records = grouped_records.get(story_idx, {}).get(para_idx, [])
 
             if para_records:
-                new_psr_xml = _rebuild_paragraph_xml(para['raw_xml'], para_records)
+                new_psr_xml = _rebuild_paragraph_xml(
+                    para['raw_xml'], para_records, global_punct_template
+                )
                 para_rebuilt_count += 1
             else:
                 new_psr_xml = para['raw_xml']
