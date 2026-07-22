@@ -201,6 +201,7 @@ def extract_from_idml(idml_path: str) -> list[dict]:
           }
     """
     stories: list[dict] = []
+    raw_story_xmls: dict[str, str] = {}  # 保留原始 XML 用于自检
 
     with zipfile.ZipFile(idml_path, 'r') as zf:
         # 读取 designmap.xml 获取 Story 顺序
@@ -214,6 +215,7 @@ def extract_from_idml(idml_path: str) -> list[dict]:
                 continue
 
             story_xml = zf.read(story_path).decode('utf-8')
+            raw_story_xmls[story_name] = story_xml
             paragraphs = _parse_story_xml(story_xml, story_idx)
             stories.append({
                 'name': story_name,
@@ -222,6 +224,10 @@ def extract_from_idml(idml_path: str) -> list[dict]:
                 'xml_footer': _get_story_footer(story_xml),
                 'paragraphs': paragraphs,
             })
+
+    # 自检：直接用正则从原始 XML 提取全部 Content 文本，
+    # 与解析器提取结果比对，确保没有任何字符被漏掉
+    _verify_extraction(stories, raw_story_xmls)
 
     return stories
 
@@ -232,6 +238,84 @@ def _parse_story_order(designmap_xml: str) -> list[str]:
     if match:
         return match.group(1).split()
     return []
+
+
+def _verify_extraction(stories: list[dict], raw_story_xmls: dict[str, str]) -> None:
+    """自检：确保解析器没有遗漏任何 Content 文本。
+
+    独立于主解析逻辑，直接用正则从原始 Story XML 中提取所有
+    <Content>...</Content> 文本，与解析器产出的净文字逐 Story 比对。
+    任何不一致都会抛出 ValueError，阻止静默的数据丢失。
+    """
+    for story in stories:
+        story_name = story['name']
+        raw_xml = raw_story_xmls.get(story_name)
+        if raw_xml is None:
+            continue
+
+        # 直接从原始 XML 提取全部 Content 文本（不依赖解析器）
+        raw_contents = re.findall(r'<Content>(.*?)</Content>', raw_xml, re.DOTALL)
+        # 去除加工指令（如 <?ACE 18?>），与解析器行为一致
+        raw_text = re.sub(r'<\?.*?\?>', '', ''.join(raw_contents))
+        # 模拟解析器的段落末尾全角空格去除：
+        # 解析器在每个 ParagraphStyleRange 末尾去除尾随的 U+3000，
+        # 这里按 ParagraphStyleRange 边界分割后各自 rstrip
+        raw_filtered: list[str] = []
+        for psr_match in re.finditer(
+            r'<ParagraphStyleRange[^>]*>(.*?)</ParagraphStyleRange>',
+            raw_xml, re.DOTALL
+        ):
+            psr_contents = re.findall(
+                r'<Content>(.*?)</Content>', psr_match.group(1), re.DOTALL
+            )
+            psr_text = re.sub(r'<\?.*?\?>', '', ''.join(psr_contents))
+            # 去除段落末尾的全角空格（与解析器行为一致）
+            psr_text = psr_text.rstrip('　')
+            for ch in psr_text:
+                if _is_old_punct(ch):
+                    continue
+                if _is_unicode_whitespace(ch):
+                    continue
+                raw_filtered.append(ch)
+
+        # 从解析器结果收集全部字符（与上述 raw_filtered 使用相同过滤规则）
+        parsed_filtered: list[str] = []
+        for rec in story['paragraphs']:
+            for rec in rec['chars']:
+                ch = rec['char']
+                if rec.get('is_special', False):
+                    continue
+                if rec['is_punct']:
+                    continue
+                if _is_unicode_whitespace(ch):
+                    continue
+                parsed_filtered.append(ch)
+
+        raw_str = ''.join(raw_filtered)
+        parsed_str = ''.join(parsed_filtered)
+
+        if raw_str != parsed_str:
+            # 定位第一个差异
+            min_len = min(len(raw_str), len(parsed_str))
+            for i in range(min_len):
+                if raw_str[i] != parsed_str[i]:
+                    ctx_start = max(0, i - 30)
+                    ctx_end = min(min_len, i + 30)
+                    raise ValueError(
+                        f"IDML 解析自检失败！Story '{story_name}' 提取结果与原始 XML 不一致。\n"
+                        f"原始 XML Content 净字数: {len(raw_str)}\n"
+                        f"解析器提取净字数:     {len(parsed_str)}\n"
+                        f"第一个差异在位置 {i}:\n"
+                        f"  原始 XML: ...{raw_str[ctx_start:ctx_end]}...\n"
+                        f"  解析器:   ...{parsed_str[ctx_start:ctx_end]}...\n"
+                        f"  原始字符: U+{ord(raw_str[i]):04X} ('{raw_str[i]}')\n"
+                        f"  解析字符: U+{ord(parsed_str[i]):04X} ('{parsed_str[i]}')\n"
+                        f"这通常意味着解析器遗漏了某种 XML 结构。"
+                    )
+            raise ValueError(
+                f"IDML 解析自检失败！Story '{story_name}' 净字数不一致: "
+                f"原始 XML {len(raw_str)} vs 解析器 {len(parsed_str)}"
+            )
 
 
 def _parse_story_xml(story_xml: str, story_idx: int) -> list[dict]:
