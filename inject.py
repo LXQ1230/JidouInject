@@ -651,11 +651,13 @@ def _rebuild_paragraph_xml(
             'contents': contents,
         })
         if csr_list[-1]['is_punct'] and csr_list[-1]['contents']:
+            tmpl_xml = m.group(0)
+            if '<Br' in tmpl_xml:
+                tmpl_xml = re.sub(r'<Br\s*/>', '', tmpl_xml)  # 去 Br
             if punct_template is None:
-                punct_template = m.group(0)
-            elif '。</Content>' in m.group(0) and '。</Content>' not in punct_template:
-                # 优先使用 Content 为 。的模板（部分句号 CSR 的 Content 为空格）
-                punct_template = m.group(0)
+                punct_template = tmpl_xml
+            elif '。</Content>' in tmpl_xml and '。</Content>' not in punct_template:
+                punct_template = tmpl_xml
         csr_idx += 1
 
     if punct_template is None or '。</Content>' not in punct_template:
@@ -721,7 +723,9 @@ def _rebuild_paragraph_xml(
             )
         else:
             # 需要拆分：生成多个 CSR（文字 + 句号交错）
-            # Br 只放在第一个文本部分前面，后缀只放在最后一个文本部分
+            # - csr_prefix（可能含 Br）仅给第一个文本部分
+            # - csr_suffix（可能含 Br）放在所有部分末尾
+            # - 中间的文本部分和句号部分用干净前后缀
             clean_prefix = re.sub(r'<Br\s*/>', '', csr_prefix)
             clean_suffix = csr_xml[csr_xml.rfind('</CharacterStyleRange>'):]
             non_punct_parts = [i for i, (is_p, _) in enumerate(segments) if not is_p]
@@ -731,12 +735,13 @@ def _rebuild_paragraph_xml(
                     parts.append(punct_template)
                 else:
                     pfx = csr_prefix if i == non_punct_parts[0] else clean_prefix
-                    sfx = csr_suffix if i == non_punct_parts[-1] else clean_suffix
                     parts.append(
                         pfx
                         + f'<Content>{_xml_escape(text)}</Content>'
-                        + sfx
+                        + clean_suffix
                     )
+            # 后缀加在整个拆分序列末尾
+            parts[-1] = parts[-1].replace(clean_suffix, csr_suffix)
             csr_replacements[ci] = ''.join(parts)
 
     # 5. 应用替换：从后往前
