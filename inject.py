@@ -128,6 +128,20 @@ def _is_unicode_whitespace(ch: str) -> bool:
     return False
 
 
+def _is_ws_for_compare(ch: str) -> bool:
+    """判断字符是否为比对时应忽略的空白。
+
+    与 _is_unicode_whitespace() 不同，此函数将 U+3000（全角空格）也视为空白。
+    比对和字符对齐时使用，确保句读结果中的空格差异不影响文字匹配。
+    IDML 原文中的空格原样保留在输出中。
+    """
+    if _is_unicode_whitespace(ch):
+        return True
+    if ord(ch) == 0x3000:
+        return True
+    return False
+
+
 def main():
     parser = argparse.ArgumentParser(description="IDML 句读结果回注工具")
     parser.add_argument("--idml", required=True, help="原始 IDML 文件路径")
@@ -476,7 +490,9 @@ def validate_and_align(stories: list[dict], result_chars: list[str]) -> dict:
             for rec in para['chars']:
                 all_idml_records.append(rec)
 
-    # 提取 IDML 净文字（跳过旧标点、特殊标记如 <?ACE 18?>、以及 Unicode 布局空白）
+    # 提取 IDML 净文字（跳过旧标点、特殊标记如 <?ACE 18?>）
+    # 注意：全角空格 U+3000 保留在 idml_clean_indices 中，因为 IDML 的所有空白
+    # 都是排版的一部分，应原样保留在输出中
     idml_clean_indices: list[int] = []
     for i, rec in enumerate(all_idml_records):
         ch = rec['char']
@@ -486,53 +502,54 @@ def validate_and_align(stories: list[dict], result_chars: list[str]) -> dict:
             continue
         idml_clean_indices.append(i)
 
-    idml_clean_chars = [all_idml_records[i]['char'] for i in idml_clean_indices]
-    result_clean_chars = [c for c in result_chars if c != '。']
+    # 比对用的净文字：双方都排除比对空白（含 U+3000）
+    idml_compare_chars = [
+        all_idml_records[i]['char'] for i in idml_clean_indices
+        if not _is_ws_for_compare(all_idml_records[i]['char'])
+    ]
+    result_compare_chars = [c for c in result_chars if c != '。' and not _is_ws_for_compare(c)]
 
-    # 逐字比对验证
-    idml_clean_str = ''.join(idml_clean_chars)
-    result_clean_str = ''.join(result_clean_chars)
+    # 逐字比对验证（排除空白字符）
+    idml_compare_str = ''.join(idml_compare_chars)
+    result_compare_str = ''.join(result_compare_chars)
 
-    if idml_clean_str != result_clean_str:
+    if idml_compare_str != result_compare_str:
         # 找到第一个差异位置
-        min_len = min(len(idml_clean_str), len(result_clean_str))
+        min_len = min(len(idml_compare_str), len(result_compare_str))
         for i in range(min_len):
-            a = idml_clean_str[i]
-            b = result_clean_str[i]
+            a = idml_compare_str[i]
+            b = result_compare_str[i]
             if a != b:
                 ctx_start = max(0, i - 50)
                 ctx_end = min(min_len, i + 50)
-                # 构建差异位置的十六进制上下文
-                idml_hex = ' '.join(f'{ord(c):04X}' for c in idml_clean_str[ctx_start:ctx_end])
-                result_hex = ' '.join(f'{ord(c):04X}' for c in result_clean_str[ctx_start:ctx_end])
                 raise ValueError(
                     f"字数验证失败！\n"
-                    f"IDML 净文字数: {len(idml_clean_str)}\n"
-                    f"句读结果净文字数: {len(result_clean_str)}\n"
+                    f"IDML 净文字数（不含空白）: {len(idml_compare_str)}\n"
+                    f"句读结果净文字数（不含空白）: {len(result_compare_str)}\n"
                     f"第一个差异在位置 {i} (上下文 {ctx_start}-{ctx_end}):\n"
-                    f"  IDML: ...{idml_clean_str[ctx_start:ctx_end]}...\n"
-                    f"  结果: ...{result_clean_str[ctx_start:ctx_end]}...\n"
+                    f"  IDML: ...{idml_compare_str[ctx_start:ctx_end]}...\n"
+                    f"  结果: ...{result_compare_str[ctx_start:ctx_end]}...\n"
                     f"  IDML @{i}: U+{ord(a):04X} ('{a}')\n"
                     f"  结果 @{i}: U+{ord(b):04X} ('{b}')\n"
                     f"提示: 句读结果与 IDML 原文不一致，"
                     f"请确认结果文件是从该 IDML 导出的文本生成的。"
                 )
         raise ValueError(
-            f"字数验证失败！IDML: {len(idml_clean_str)} 字, "
-            f"结果: {len(result_clean_str)} 字（内容相同但长度不同）"
+            f"字数验证失败！IDML: {len(idml_compare_str)} 字, "
+            f"结果: {len(result_compare_str)} 字（内容相同但长度不同）"
         )
 
-    print(f"验证通过: {len(idml_clean_str)} 字一致")
+    print(f"验证通过: {len(idml_compare_str)} 字一致")
 
-    # 对齐: 遍历句读结果，每个字符映射到对应的 IDML 段落和样式
-    clean_idx = 0          # 在 idml_clean_indices 中的位置
+    # 对齐: 遍历句读结果，将非空白字符映射到对应 IDML 字符，
+    # 同时保留 IDML 中原有的空白字符（全角空格等）
+    idml_idx = 0           # 在 idml_clean_indices 中的位置
     last_para = None       # 上一个字符的 (story_idx, para_idx)
     new_records: list[dict] = []
     punct_style = _find_punct_style(all_idml_records)
 
     for ch in result_chars:
         if ch == '。':
-            # 新增句号：归属到上一个字符的段落
             story_idx, para_idx = last_para if last_para else (0, 0)
             new_records.append({
                 'char': '。',
@@ -542,22 +559,39 @@ def validate_and_align(stories: list[dict], result_chars: list[str]) -> dict:
                 'story_idx': story_idx,
                 'para_idx': para_idx,
             })
+        elif _is_ws_for_compare(ch):
+            # 句读结果中的空白：丢弃（全部使用 IDML 的空白）
+            pass
         else:
-            # 普通文字：映射到对应 IDML 字符的样式和段落
-            target_idx = idml_clean_indices[clean_idx]
-            orig_rec = all_idml_records[target_idx]
-
-            new_records.append({
-                'char': ch,
-                'is_punct': False,
-                'is_special': False,
-                'style': orig_rec['style'],
-                'story_idx': orig_rec['story_idx'],
-                'para_idx': orig_rec['para_idx'],
-            })
-
-            last_para = (orig_rec['story_idx'], orig_rec['para_idx'])
-            clean_idx += 1
+            # 非空白文字：推进 IDML 指针到下一个非空白字符
+            # 途中的 IDML 空白字符原样保留在输出中
+            while idml_idx < len(idml_clean_indices):
+                target_idx = idml_clean_indices[idml_idx]
+                orig_rec = all_idml_records[target_idx]
+                idml_idx += 1
+                if _is_ws_for_compare(orig_rec['char']):
+                    # IDML 的空白字符 → 原样加入输出
+                    last_para = (orig_rec['story_idx'], orig_rec['para_idx'])
+                    new_records.append({
+                        'char': orig_rec['char'],
+                        'is_punct': False,
+                        'is_special': False,
+                        'style': orig_rec['style'],
+                        'story_idx': orig_rec['story_idx'],
+                        'para_idx': orig_rec['para_idx'],
+                    })
+                else:
+                    # 匹配到非空白字符 → 用 IDML 的字符和样式
+                    last_para = (orig_rec['story_idx'], orig_rec['para_idx'])
+                    new_records.append({
+                        'char': orig_rec['char'],
+                        'is_punct': False,
+                        'is_special': False,
+                        'style': orig_rec['style'],
+                        'story_idx': orig_rec['story_idx'],
+                        'para_idx': orig_rec['para_idx'],
+                    })
+                    break
 
     # 按 (story_idx, para_idx) 分组
     grouped: dict = {}  # {story_idx: {para_idx: [records]}}
@@ -808,16 +842,20 @@ def _verify_output(output_path: str, expected_chars: list[str]) -> None:
             for rec in para['chars']:
                 all_records.append(rec)
 
-    # 构建输出字符序列
+    # 构建输出字符序列（排除比对空白，因为对齐时已丢弃结果中的空白，
+    # 只保留 IDML 的空白，所以输出在空白上必然与输入不同）
     output_chars: list[str] = []
     for rec in all_records:
         ch = rec['char']
         if _is_unicode_whitespace(ch):
             continue
+        if _is_ws_for_compare(ch):
+            continue
         output_chars.append(ch)
 
-    # 比对
-    expected_str = ''.join(expected_chars)
+    # 比对（排除空白后，文字和句号序列必须一致）
+    expected_filtered = [c for c in expected_chars if not _is_ws_for_compare(c)]
+    expected_str = ''.join(expected_filtered)
     output_str = ''.join(output_chars)
 
     if output_str == expected_str:
