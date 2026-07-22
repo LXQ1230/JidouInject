@@ -640,11 +640,15 @@ def _rebuild_paragraph_xml(
     csr_idx = 0
     for m in re.finditer(csr_pattern, original_psr_xml, re.DOTALL):
         inner = m.group(2) or ''
+        contents = re.findall(r'<Content>(.*?)</Content>', inner, re.DOTALL)
         csr_list.append({
             'idx': csr_idx,
             'match': m,
-            'is_punct': 'CharacterStyle/句号' in m.group(1),
-            'contents': re.findall(r'<Content>(.*?)</Content>', inner, re.DOTALL),
+            'is_punct': (
+                'CharacterStyle/句号' in m.group(1)
+                or ''.join(contents) == '。'
+            ),
+            'contents': contents,
         })
         if csr_list[-1]['is_punct'] and csr_list[-1]['contents'] and punct_template is None:
             punct_template = m.group(0)
