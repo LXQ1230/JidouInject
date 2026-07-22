@@ -537,21 +537,23 @@ def validate_and_align(stories: list[dict], result_chars: list[str]) -> dict:
     # 对齐: 遍历句读结果，将非空白字符映射到对应 IDML 字符，
     # 同时保留 IDML 中原有的空白字符（全角空格等）
     idml_idx = 0           # 在 idml_clean_indices 中的位置
-    last_slot = None       # 上一个字符的 (story_idx, para_idx, csr_idx, content_slot)
+    last_slot = None       # 段落归属 (story_idx, para_idx, csr_idx, content_slot)
+    last_text_csr = None   # 「。」插入的文本位置 (csr_idx) — 不更新到 ws 上
     new_records: list[dict] = []
 
     for ch in result_chars:
         if ch == '。':
-            si, pi, ci, sl = last_slot if last_slot else (0, 0, 0, 0)
+            si, pi, _, _ = last_slot if last_slot else (0, 0, 0, 0)
+            ci = last_text_csr if last_text_csr is not None else 0
             new_records.append({
                 'char': '。',
                 'is_punct': True,
                 'is_special': False,
                 'story_idx': si,
                 'para_idx': pi,
-                'csr_idx': -1,       # 标记：重建时插入旧句号槽位或末尾
+                'csr_idx': -1,
                 'content_slot': -1,
-                'after_csr': ci,     # 插入在此 csr_idx 之后
+                'after_csr': ci,
             })
         elif _is_ws_for_compare(ch):
             pass
@@ -575,6 +577,7 @@ def validate_and_align(stories: list[dict], result_chars: list[str]) -> dict:
                 else:
                     last_slot = (orig_rec['story_idx'], orig_rec['para_idx'],
                                  orig_rec['csr_idx'], orig_rec['content_slot'])
+                    last_text_csr = orig_rec['csr_idx']
                     new_records.append({
                         'char': orig_rec['char'],
                         'is_punct': False,
@@ -668,39 +671,59 @@ def _rebuild_paragraph_xml(
     if punct_template is None:
         punct_template = global_punct_template
 
-    # 4. 清空所有旧句号 CSR（原 。位置），新句号将插入到正确位置
+    # 4. 清空所有旧句号 CSR 的 Content
     for ci in punct_csr_indices:
         for si in range(sum(1 for (c, s) in slot_order if c == ci)):
-            key = (ci, si)
-            if key not in slot_texts or slot_texts[key] is None:
-                slot_texts[key] = ''
+            slot_texts[(ci, si)] = ''
 
-    # 5. 替换所有 Content 文本（同前，从后往前）
+    # 5. 替换所有 Content 文本
     content_matches = list(
         re.finditer(r'<Content>(.*?)</Content>', original_psr_xml, re.DOTALL)
     )
-    replacements = []
-    for i, old_match in enumerate(content_matches):
-        if i < len(slot_order):
-            key = slot_order[i]
-            new_text = slot_texts.get(key, '')
-        else:
-            new_text = ''
-        new_tag = f'<Content>{_xml_escape(new_text)}</Content>'
-        replacements.append((old_match.start(), old_match.end(), new_tag))
-
     result = original_psr_xml
-    for start, end, new_tag in reversed(replacements):
-        result = result[:start] + new_tag + result[end:]
+    for i in range(len(content_matches) - 1, -1, -1):
+        old_match = content_matches[i]
+        key = slot_order[i] if i < len(slot_order) else None
+        new_text = slot_texts.get(key, '') if key else ''
+        new_tag = f'<Content>{_xml_escape(new_text)}</Content>'
+        result = result[:old_match.start()] + new_tag + result[old_match.end():]
 
-    # 6. 将新句号插入到对应 text CSR 之后
+    # 6. 删除旧句号 CSR 后重新计算 after_csr 偏移，再插入新句号
+    result = _remove_empty_punct_csrs(result, csr_pattern)
     if punct_records:
         tmpl = punct_template
         if tmpl is None or '。</Content>' not in tmpl:
             tmpl = global_punct_template
         if tmpl is not None:
-            result = _insert_punct_csrs(result, punct_records, tmpl)
+            # 调整 after_csr：旧句号 CSR 被删除后，csr_idx 发生偏移
+            adjusted_records = []
+            for prec in punct_records:
+                old_csr = prec.get('after_csr', -1)
+                if old_csr < 0:
+                    adjusted_records.append(prec)
+                    continue
+                # 计算在 old_csr 之前被删除的旧句号 CSR 数量
+                deleted_before = sum(
+                    1 for ci in punct_csr_indices if ci < old_csr
+                )
+                new_csr = old_csr - deleted_before
+                adjusted_records.append({**prec, 'after_csr': new_csr})
+            result = _insert_punct_csrs(result, adjusted_records, tmpl)
 
+    return result
+
+
+def _remove_empty_punct_csrs(xml: str, csr_pattern: str) -> str:
+    """删除 Content 为空的句号 CSR。"""
+    result = xml
+    # 从后往前删除，避免位置偏移
+    for m in reversed(list(re.finditer(csr_pattern, xml, re.DOTALL))):
+        attrs = m.group(1)
+        if 'CharacterStyle/句号' not in attrs:
+            continue
+        contents = re.findall(r'<Content>(.*?)</Content>', m.group(0), re.DOTALL)
+        if all(c == '' for c in contents):
+            result = result[:m.start()] + result[m.end():]
     return result
 
 
