@@ -658,7 +658,7 @@ def _rebuild_paragraph_xml(
                 punct_template = m.group(0)
         csr_idx += 1
 
-    if punct_template is None:
+    if punct_template is None or '。</Content>' not in punct_template:
         punct_template = global_punct_template
 
     # 3. 将记录按 csr_idx 分组（含句号：after_csr 指向它跟随的文字 CSR）
