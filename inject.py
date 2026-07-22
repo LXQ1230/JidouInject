@@ -13,10 +13,8 @@ import os
 import re
 import argparse
 import shutil
-import tempfile
 import zipfile
 import unicodedata
-from xml.etree import ElementTree as ET
 
 # 旧标点字符集 — 在句读处理前需从原文中清除的所有标点
 _OLD_PUNCT_CHARS: set[str] = {
@@ -137,6 +135,24 @@ def main():
     parser.add_argument("--output", help="输出 IDML 路径（默认自动生成）")
     args = parser.parse_args()
 
+    # 输入文件存在性检查
+    if not os.path.isfile(args.idml):
+        print(f"错误: IDML 文件不存在: {args.idml}")
+        sys.exit(1)
+    if not os.path.isfile(args.result):
+        print(f"错误: 句读结果文件不存在: {args.result}")
+        sys.exit(1)
+
+    # IDML 文件基本校验（是否为有效 ZIP）
+    try:
+        with zipfile.ZipFile(args.idml, 'r') as zf:
+            if 'designmap.xml' not in zf.namelist():
+                print(f"错误: 文件不是有效的 IDML（缺少 designmap.xml）: {args.idml}")
+                sys.exit(1)
+    except zipfile.BadZipFile:
+        print(f"错误: 文件不是有效的 ZIP/IDML 文件: {args.idml}")
+        sys.exit(1)
+
     if args.output is None:
         base = os.path.splitext(args.idml)[0]
         args.output = f"{base}_WD注入.idml"
@@ -145,7 +161,16 @@ def main():
     print(f"句读结果: {args.result}")
     print(f"输出文件: {args.output}")
 
-    process(args.idml, args.result, args.output)
+    try:
+        process(args.idml, args.result, args.output)
+    except ValueError as e:
+        print(f"\n处理失败: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n未预期的错误: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 
 def extract_from_idml(idml_path: str) -> list[dict]:
@@ -387,20 +412,26 @@ def validate_and_align(stories: list[dict], result_chars: list[str]) -> dict:
             a = idml_clean_str[i]
             b = result_clean_str[i]
             if a != b:
-                ctx = max(0, i - 20)
+                ctx_start = max(0, i - 50)
+                ctx_end = min(min_len, i + 50)
+                # 构建差异位置的十六进制上下文
+                idml_hex = ' '.join(f'{ord(c):04X}' for c in idml_clean_str[ctx_start:ctx_end])
+                result_hex = ' '.join(f'{ord(c):04X}' for c in result_clean_str[ctx_start:ctx_end])
                 raise ValueError(
                     f"字数验证失败！\n"
                     f"IDML 净文字数: {len(idml_clean_str)}\n"
                     f"句读结果净文字数: {len(result_clean_str)}\n"
-                    f"第一个差异在位置 {i}:\n"
-                    f"  IDML: ...{idml_clean_str[ctx:i+20]}...\n"
-                    f"  结果: ...{result_clean_str[ctx:i+20]}...\n"
-                    f"  IDML 字符: '{a}' (U+{ord(a):04X})\n"
-                    f"  结果字符: '{b}' (U+{ord(b):04X})"
+                    f"第一个差异在位置 {i} (上下文 {ctx_start}-{ctx_end}):\n"
+                    f"  IDML: ...{idml_clean_str[ctx_start:ctx_end]}...\n"
+                    f"  结果: ...{result_clean_str[ctx_start:ctx_end]}...\n"
+                    f"  IDML @{i}: U+{ord(a):04X} ('{a}')\n"
+                    f"  结果 @{i}: U+{ord(b):04X} ('{b}')\n"
+                    f"提示: 句读结果与 IDML 原文不一致，"
+                    f"请确认结果文件是从该 IDML 导出的文本生成的。"
                 )
         raise ValueError(
             f"字数验证失败！IDML: {len(idml_clean_str)} 字, "
-            f"结果: {len(result_clean_str)} 字"
+            f"结果: {len(result_clean_str)} 字（内容相同但长度不同）"
         )
 
     print(f"验证通过: {len(idml_clean_str)} 字一致")
@@ -463,6 +494,8 @@ def _find_punct_style(all_records: list[dict]) -> str | None:
         if rec['is_punct'] and rec.get('style'):
             return rec['style']
     # 如果找不到，返回 None（后续生成 IDML 时使用默认样式）
+    print("  警告: 未在 IDML 中找到已有的句号样式（CharacterStyle/句号），"
+          "新增句号将使用段落默认样式")
     return None
 
 
@@ -510,8 +543,13 @@ def _rebuild_paragraph_xml(
     # 提取 ParagraphStyleRange 的后缀（最后一个 CharacterStyleRange 之后的内容）
     last_csr_end = original_psr_xml.rfind('</CharacterStyleRange>')
     if last_csr_end >= 0:
-        suffix_start = original_psr_xml.find('>', last_csr_end) + 1
-        suffix = original_psr_xml[suffix_start:]
+        close_bracket = original_psr_xml.find('>', last_csr_end)
+        if close_bracket >= 0:
+            suffix_start = close_bracket + 1
+            suffix = original_psr_xml[suffix_start:]
+        else:
+            # 防御性处理：理论上有效 XML 不应该走到这里
+            suffix = '\n</ParagraphStyleRange>'
     else:
         suffix = '\n</ParagraphStyleRange>'
 
