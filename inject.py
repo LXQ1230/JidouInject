@@ -361,58 +361,77 @@ def _parse_paragraph_style_range(
     for match in re.finditer(csr_pattern, psr_xml, re.DOTALL):
         attrs_str = match.group(1)
         inner = match.group(2) if match.group(2) else ''
+        full_csr_xml = match.group(0)
 
-        is_punct = 'CharacterStyle/句号' in attrs_str or 'CharacterStyle/句号' in inner
-
-        # 查找 ALL Content 元素（处理同一 CSR 内有多个 <Content> 被 <Br/> 等隔开的情况）
+        # 查找 ALL Content 元素
         content_matches = list(
             re.finditer(r'<Content>(.*?)</Content>', inner, re.DOTALL)
         )
         if not content_matches:
             continue
-        content_text = ''.join(m.group(1) for m in content_matches)
 
-        # 生成样式模板 — 覆盖从第一个 Content 到最后一个 Content 的全部范围
-        # 将多 Content + 中间元素（如 <Br/>）整体替换为 {content} 占位符
-        full_csr_xml = match.group(0)
-        full_content_matches = list(
-            re.finditer(r'<Content>(.*?)</Content>', full_csr_xml, re.DOTALL)
-        )
-        if full_content_matches:
-            first_start = full_content_matches[0].start()
-            last_end = full_content_matches[-1].end()
-            style_template = (
-                full_csr_xml[:first_start]
-                + '{content}'
-                + full_csr_xml[last_end:]
+        # 将 CSR 内部按 <Br/> 分割为多个片段，每个片段生成独立的样式模板
+        # 这样 Br 换行标记在重建时得以保留
+        segments = re.split(r'<Br\s*/>', inner)
+        for seg_idx, segment in enumerate(segments):
+            seg_contents = re.findall(
+                r'<Content>(.*?)</Content>', segment, re.DOTALL
             )
-        else:
-            style_template = full_csr_xml
+            if not seg_contents:
+                continue
+            seg_text = ''.join(seg_contents)
 
-        # 特殊加工指令（如 <?ACE 18?>）
-        if re.match(r'<\?ACE\s', content_text):
-            chars.append({
-                'char': content_text,
-                'is_punct': False,
-                'is_special': True,
-                'style': style_template,
-                'story_idx': story_idx,
-                'para_idx': para_idx,
-            })
-            continue
+            # 为此片段构建独立的单 Content CSR 模板
+            opening_end = full_csr_xml.index('>') + 1
+            opening_tag = full_csr_xml[:opening_end]
+            props_match = re.search(
+                r'<Properties>.*?</Properties>', full_csr_xml, re.DOTALL
+            )
+            props = props_match.group(0) if props_match else ''
+            seg_template = (
+                opening_tag + props
+                + '{content}'
+                + '</CharacterStyleRange>'
+            )
 
-        for ch in content_text:
-            chars.append({
-                'char': ch,
-                'is_punct': _is_old_punct(ch),
-                'is_special': False,
-                'style': style_template,
-                'story_idx': story_idx,
-                'para_idx': para_idx,
-            })
+            # 特殊加工指令（如 <?ACE 18?>）
+            if re.match(r'<\?ACE\s', seg_text):
+                chars.append({
+                    'char': seg_text,
+                    'is_punct': False,
+                    'is_special': True,
+                    'style': seg_template,
+                    'story_idx': story_idx,
+                    'para_idx': para_idx,
+                })
+                continue
 
-    # 去除段落末尾的全角空格（IDML 布局留白，TXT 导出时会忽略）
-    while chars and chars[-1]['char'] == '　':
+            for ch in seg_text:
+                chars.append({
+                    'char': ch,
+                    'is_punct': _is_old_punct(ch),
+                    'is_special': False,
+                    'style': seg_template,
+                    'story_idx': story_idx,
+                    'para_idx': para_idx,
+                })
+
+            # 在片段之间插入 Br 标记（最后一个片段之后不加）
+            if seg_idx < len(segments) - 1:
+                chars.append({
+                    'char': '',
+                    'is_punct': False,
+                    'is_special': True,
+                    'style': '<Br/>',
+                    'story_idx': story_idx,
+                    'para_idx': para_idx,
+                })
+
+    # 去除段落末尾的全角空格及尾部孤立的 Br 标记
+    # （IDML 布局留白，TXT 导出时会忽略）
+    while chars and (
+        chars[-1]['char'] == '　' or chars[-1].get('is_special', False)
+    ):
         chars.pop()
 
     return chars
@@ -682,14 +701,18 @@ def _rebuild_paragraph_xml(
         rec = new_char_records[i]
 
         if rec.get('is_special', False):
-            # 特殊标记：使用样式模板但内容不转义
+            # Br 换行标记：直接输出 <Br/>
+            if rec.get('style') == '<Br/>':
+                csr_elements.append('<Br/>')
+                i += 1
+                continue
+            # 特殊标记（如 <?ACE 18?>）：使用样式模板但内容不转义
             if rec.get('style'):
                 csr_xml = rec['style'].replace(
                     '{content}', f'<Content>{rec["char"]}</Content>'
                 )
                 csr_elements.append(csr_xml)
             else:
-                # 回退：直接保留字符值（不应发生，因为已修复提取逻辑）
                 csr_elements.append(rec['char'])
             i += 1
             continue
