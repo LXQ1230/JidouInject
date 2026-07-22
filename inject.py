@@ -208,9 +208,10 @@ def extract_from_idml(idml_path: str) -> list[dict]:
           char_record = {
             'char': str,
             'is_punct': bool,
-            'style': str | None,    # CharacterStyleRange XML 模板（Content 替换为 {content}）
             'story_idx': int,
             'para_idx': int,
+            'csr_idx': int,        # 属于段落中第几个 CSR
+            'content_slot': int,   # 属于 CSR 中第几个 <Content>
             'is_special': bool,
           }
     """
@@ -350,85 +351,62 @@ def _parse_story_xml(story_xml: str, story_idx: int) -> list[dict]:
 def _parse_paragraph_style_range(
     psr_xml: str, story_idx: int, para_idx: int
 ) -> list[dict]:
-    """
-    从 ParagraphStyleRange XML 中提取所有字符记录。
-    每个记录标记其所属的 story 和 paragraph，用于后续按段落重建。
+    """从 ParagraphStyleRange XML 中提取所有字符记录。
+
+    每个记录标记其所属的 story、paragraph、CSR 索引和 Content 槽位。
     """
     chars: list[dict] = []
 
     csr_pattern = r'<CharacterStyleRange([^>]*?)(?:>(.*?)</CharacterStyleRange>|/>)'
+    csr_idx = 0
 
     for match in re.finditer(csr_pattern, psr_xml, re.DOTALL):
-        attrs_str = match.group(1)
         inner = match.group(2) if match.group(2) else ''
 
-        is_punct = 'CharacterStyle/句号' in attrs_str or 'CharacterStyle/句号' in inner
-
-        # 查找 ALL Content 元素（处理同一 CSR 内有多个 <Content> 被 <Br/> 等隔开的情况）
+        # 找到此 CSR 内所有的 <Content> 元素
         content_matches = list(
             re.finditer(r'<Content>(.*?)</Content>', inner, re.DOTALL)
         )
+
         if not content_matches:
-            # CSR 无 Content 但有 Br → 纯 Br 标记，需保留
-            if '<Br' in inner:
+            # 无 Content → 可能是纯 Br CSR。csr_idx 仍需递增以保证
+            # 后续 CSR 的索引正确，但不产生任何字符记录
+            csr_idx += 1
+            continue
+
+        # 每个 <Content> → 一组字符，打上槽位标签
+        for slot_idx, cm in enumerate(content_matches):
+            content_text = cm.group(1)
+
+            # 特殊加工指令（如 <?ACE 18?>）
+            if re.match(r'<\?ACE\s', content_text):
                 chars.append({
-                    'char': '',
+                    'char': content_text,
                     'is_punct': False,
                     'is_special': True,
-                    'style': full_csr_xml,
                     'story_idx': story_idx,
                     'para_idx': para_idx,
+                    'csr_idx': csr_idx,
+                    'content_slot': slot_idx,
                 })
-            continue
-        content_text = ''.join(m.group(1) for m in content_matches)
+                continue
 
-        # 生成样式模板 — 覆盖从第一个 Content 到最后一个 Content 的全部范围
-        # 将多 Content + 中间元素（如 <Br/>）整体替换为 {content} 占位符
-        full_csr_xml = match.group(0)
-        full_content_matches = list(
-            re.finditer(r'<Content>(.*?)</Content>', full_csr_xml, re.DOTALL)
-        )
-        if full_content_matches:
-            first_start = full_content_matches[0].start()
-            last_end = full_content_matches[-1].end()
-            style_template = (
-                full_csr_xml[:first_start]
-                + '{content}'
-                + full_csr_xml[last_end:]
-            )
-        else:
-            style_template = full_csr_xml
+            for ch in content_text:
+                chars.append({
+                    'char': ch,
+                    'is_punct': _is_old_punct(ch),
+                    'is_special': False,
+                    'story_idx': story_idx,
+                    'para_idx': para_idx,
+                    'csr_idx': csr_idx,
+                    'content_slot': slot_idx,
+                })
 
-        # 特殊加工指令（如 <?ACE 18?>）
-        if re.match(r'<\?ACE\s', content_text):
-            chars.append({
-                'char': content_text,
-                'is_punct': False,
-                'is_special': True,
-                'style': style_template,
-                'story_idx': story_idx,
-                'para_idx': para_idx,
-            })
-            continue
+        csr_idx += 1
 
-        for ch in content_text:
-            chars.append({
-                'char': ch,
-                'is_punct': _is_old_punct(ch),
-                'is_special': False,
-                'style': style_template,
-                'story_idx': story_idx,
-                'para_idx': para_idx,
-            })
-
-    # 去除段落末尾的全角空格（跳过尾部的特殊标记如纯 Br CSR）
-    while chars:
-        if chars[-1].get('is_special', False):
-            chars.pop()
-        elif chars[-1]['char'] == '　':
-            chars.pop()
-        else:
-            break
+    # 去除段落末尾的全角空格
+    while chars and chars[-1]['char'] == '　':
+        chars.pop()
 
     return chars
 
@@ -559,52 +537,51 @@ def validate_and_align(stories: list[dict], result_chars: list[str]) -> dict:
     # 对齐: 遍历句读结果，将非空白字符映射到对应 IDML 字符，
     # 同时保留 IDML 中原有的空白字符（全角空格等）
     idml_idx = 0           # 在 idml_clean_indices 中的位置
-    last_para = None       # 上一个字符的 (story_idx, para_idx)
+    last_slot = None       # 上一个字符的 (story_idx, para_idx, csr_idx, content_slot)
     new_records: list[dict] = []
-    punct_style = _find_punct_style(all_idml_records)
 
     for ch in result_chars:
         if ch == '。':
-            story_idx, para_idx = last_para if last_para else (0, 0)
+            si, pi, ci, sl = last_slot if last_slot else (0, 0, 0, 0)
             new_records.append({
                 'char': '。',
                 'is_punct': True,
                 'is_special': False,
-                'style': punct_style,
-                'story_idx': story_idx,
-                'para_idx': para_idx,
+                'story_idx': si,
+                'para_idx': pi,
+                'csr_idx': ci,
+                'content_slot': sl,
             })
         elif _is_ws_for_compare(ch):
-            # 句读结果中的空白：丢弃（全部使用 IDML 的空白）
             pass
         else:
-            # 非空白文字：推进 IDML 指针到下一个非空白字符
-            # 途中的 IDML 空白字符原样保留在输出中
             while idml_idx < len(idml_clean_indices):
                 target_idx = idml_clean_indices[idml_idx]
                 orig_rec = all_idml_records[target_idx]
                 idml_idx += 1
                 if _is_ws_for_compare(orig_rec['char']):
-                    # IDML 的空白字符 → 原样加入输出
-                    last_para = (orig_rec['story_idx'], orig_rec['para_idx'])
+                    last_slot = (orig_rec['story_idx'], orig_rec['para_idx'],
+                                 orig_rec['csr_idx'], orig_rec['content_slot'])
                     new_records.append({
                         'char': orig_rec['char'],
                         'is_punct': False,
                         'is_special': False,
-                        'style': orig_rec['style'],
                         'story_idx': orig_rec['story_idx'],
                         'para_idx': orig_rec['para_idx'],
+                        'csr_idx': orig_rec['csr_idx'],
+                        'content_slot': orig_rec['content_slot'],
                     })
                 else:
-                    # 匹配到非空白字符 → 用 IDML 的字符和样式
-                    last_para = (orig_rec['story_idx'], orig_rec['para_idx'])
+                    last_slot = (orig_rec['story_idx'], orig_rec['para_idx'],
+                                 orig_rec['csr_idx'], orig_rec['content_slot'])
                     new_records.append({
                         'char': orig_rec['char'],
                         'is_punct': False,
                         'is_special': False,
-                        'style': orig_rec['style'],
                         'story_idx': orig_rec['story_idx'],
                         'para_idx': orig_rec['para_idx'],
+                        'csr_idx': orig_rec['csr_idx'],
+                        'content_slot': orig_rec['content_slot'],
                     })
                     break
 
@@ -625,17 +602,6 @@ def validate_and_align(stories: list[dict], result_chars: list[str]) -> dict:
     return grouped
 
 
-def _find_punct_style(all_records: list[dict]) -> str | None:
-    """查找 IDML 中已有的句号样式模板"""
-    for rec in all_records:
-        if rec['is_punct'] and rec.get('style'):
-            return rec['style']
-    # 如果找不到，返回 None（后续生成 IDML 时使用默认样式）
-    print("  警告: 未在 IDML 中找到已有的句号样式（CharacterStyle/句号），"
-          "新增句号将使用段落默认样式")
-    return None
-
-
 def _xml_escape(text: str) -> str:
     """转义 XML 特殊字符。
 
@@ -654,86 +620,58 @@ def _xml_escape(text: str) -> str:
 def _rebuild_paragraph_xml(
     original_psr_xml: str, new_char_records: list[dict]
 ) -> str:
-    """用新的字符记录重建 ParagraphStyleRange 的 XML。
+    """用槽位追踪的方式重建 ParagraphStyleRange XML。
 
-    连续的相同样式字符合并为一个 CharacterStyleRange 以减少输出大小。
-    特殊标记（is_special=True）不参与合并，其内容按原样保留不转义。
-    is_punct 记录不与其他样式合并。
-
-    参数:
-        original_psr_xml: 原始 ParagraphStyleRange 的完整 XML 字符串。
-        new_char_records: 该段落的新字符记录列表。
-
-    返回:
-        重建后的 ParagraphStyleRange XML 字符串。
+    保留原始 PSR XML 的全部结构（Br、Properties 等），
+    仅替换各 <Content> 标签内的文本。
     """
     if not new_char_records:
         return original_psr_xml
 
-    # 提取 ParagraphStyleRange 的前缀（第一个 CharacterStyleRange 之前的内容）
-    first_csr = re.search(r'<CharacterStyleRange', original_psr_xml)
-    if not first_csr:
-        return original_psr_xml
-
-    prefix = original_psr_xml[:first_csr.start()]
-
-    # 提取 ParagraphStyleRange 的后缀（最后一个 CharacterStyleRange 之后的内容）
-    last_csr_end = original_psr_xml.rfind('</CharacterStyleRange>')
-    if last_csr_end >= 0:
-        close_bracket = original_psr_xml.find('>', last_csr_end)
-        if close_bracket >= 0:
-            suffix_start = close_bracket + 1
-            suffix = original_psr_xml[suffix_start:]
-        else:
-            # 防御性处理：理论上有效 XML 不应该走到这里
-            suffix = '\n</ParagraphStyleRange>'
-    else:
-        suffix = '\n</ParagraphStyleRange>'
-
-    # 生成新的 CharacterStyleRange 元素，合并连续相同样式的字符
-    csr_elements: list[str] = []
-    i = 0
-    while i < len(new_char_records):
-        rec = new_char_records[i]
-
+    # 1. 按 (csr_idx, content_slot) 收集文本
+    slot_texts: dict[tuple, str] = {}
+    for rec in new_char_records:
         if rec.get('is_special', False):
-            # 特殊标记：使用样式模板但内容不转义
-            if rec.get('style'):
-                csr_xml = rec['style'].replace(
-                    '{content}', f'<Content>{rec["char"]}</Content>'
-                )
-                csr_elements.append(csr_xml)
-            else:
-                # 回退：直接保留字符值（不应发生，因为已修复提取逻辑）
-                csr_elements.append(rec['char'])
-            i += 1
             continue
+        key = (rec['csr_idx'], rec['content_slot'])
+        slot_texts[key] = slot_texts.get(key, '') + rec['char']
 
-        # 收集连续相同样式的字符
-        chars_in_group = [rec['char']]
-        j = i + 1
-        while j < len(new_char_records):
-            next_rec = new_char_records[j]
-            if (
-                next_rec.get('is_special', False)
-                or next_rec.get('style') != rec.get('style')
-                or next_rec.get('is_punct') != rec.get('is_punct')
-            ):
-                break
-            chars_in_group.append(next_rec['char'])
-            j += 1
+    # 2. 扫描原始 PSR XML，按 CSR 顺序确定 Content 槽位顺序
+    csr_pattern = r'<CharacterStyleRange([^>]*?)(?:>(.*?)</CharacterStyleRange>|/>)'
+    slot_order: list[tuple] = []  # [(csr_idx, slot_idx), ...]
+    csr_idx = 0
+    for csr_match in re.finditer(csr_pattern, original_psr_xml, re.DOTALL):
+        inner = csr_match.group(2) or ''
+        slot_contents = re.findall(
+            r'<Content>(.*?)</Content>', inner, re.DOTALL
+        )
+        for slot_idx in range(len(slot_contents)):
+            slot_order.append((csr_idx, slot_idx))
+        csr_idx += 1
 
-        group_text = ''.join(chars_in_group)
+    # 3. 逐个替换 Content 文本
+    # 使用位置偏移量方案：先收集所有替换（start, end, new_tag），
+    # 再从后往前执行替换。这样前面的替换不会影响后面替换的位置。
+    content_matches = list(
+        re.finditer(r'<Content>(.*?)</Content>', original_psr_xml, re.DOTALL)
+    )
 
-        if rec.get('style'):
-            csr_xml = rec['style'].replace(
-                '{content}', f'<Content>{_xml_escape(group_text)}</Content>'
-            )
-            csr_elements.append(csr_xml)
+    replacements = []  # [(start_pos, end_pos, new_tag), ...]
+    for i, old_match in enumerate(content_matches):
+        if i < len(slot_order):
+            key = slot_order[i]
+            new_text = slot_texts.get(key, '')
+        else:
+            new_text = ''
+        new_tag = f'<Content>{_xml_escape(new_text)}</Content>'
+        replacements.append((old_match.start(), old_match.end(), new_tag))
 
-        i = j
+    # 从后往前替换，位置不受前面替换影响
+    result = original_psr_xml
+    for start, end, new_tag in reversed(replacements):
+        result = result[:start] + new_tag + result[end:]
 
-    return prefix + '\n'.join(csr_elements) + suffix
+    return result
 
 
 def _rebuild_story_xml(header: str, para_xmls: list[str], footer: str) -> str:
