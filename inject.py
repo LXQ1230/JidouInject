@@ -786,14 +786,80 @@ def generate_idml(
     _write_stories_to_idml(output_path, new_story_xmls)
 
 
+def _verify_output(output_path: str, expected_chars: list[str]) -> None:
+    """输出自检：从生成的 IDML 重新提取字符序列并与输入比对。
+
+    如果发现任何差异，立即删除输出文件并抛出异常。
+    这是防止写入过程（XML 重建、ZIP 打包）引入数据丢失的最后一道防线。
+    """
+    # 重新提取
+    stories = extract_from_idml(output_path)
+    all_records: list[dict] = []
+    for story in stories:
+        story_clean = sum(
+            1 for para in story['paragraphs']
+            for rec in para['chars']
+            if not rec['is_punct'] and not rec.get('is_special', False)
+            and not _is_unicode_whitespace(rec['char'])
+        )
+        if story_clean < 50:
+            continue
+        for para in story['paragraphs']:
+            for rec in para['chars']:
+                all_records.append(rec)
+
+    # 构建输出字符序列
+    output_chars: list[str] = []
+    for rec in all_records:
+        ch = rec['char']
+        if _is_unicode_whitespace(ch):
+            continue
+        output_chars.append(ch)
+
+    # 比对
+    expected_str = ''.join(expected_chars)
+    output_str = ''.join(output_chars)
+
+    if output_str == expected_str:
+        print(f"  输出验证通过: {len(output_str)} 个字符与输入完全一致")
+        return
+
+    # 验证失败 — 删除坏文件，报告差异
+    try:
+        os.remove(output_path)
+    except OSError:
+        pass
+
+    min_len = min(len(expected_str), len(output_str))
+    for i in range(min_len):
+        if expected_str[i] != output_str[i]:
+            ctx = max(0, i - 30)
+            raise ValueError(
+                f"输出 IDML 验证失败！生成的 IDML 与输入句读结果不一致。\n"
+                f"（输出文件已删除: {output_path}）\n"
+                f"输入字符数: {len(expected_str)}\n"
+                f"输出字符数: {len(output_str)}\n"
+                f"第一个差异在位置 {i}:\n"
+                f"  输入: ...{expected_str[ctx:i+30]}...\n"
+                f"  输出: ...{output_str[ctx:i+30]}...\n"
+                f"  输入 @{i}: U+{ord(expected_str[i]):04X} ('{expected_str[i]}')\n"
+                f"  输出 @{i}: U+{ord(output_str[i]):04X} ('{output_str[i]}')"
+            )
+    raise ValueError(
+        f"输出 IDML 验证失败！字符数不一致: "
+        f"输入 {len(expected_str)} vs 输出 {len(output_str)}"
+        f"\n（输出文件已删除: {output_path}）"
+    )
+
+
 def process(idml_path, result_path, output_path):
     """主处理流程"""
     print("=" * 60)
     print("IDML 句读结果回注工具")
     print("=" * 60)
 
-    # Step 1: 从 IDML 提取
-    print("\n[1/4] 解析 IDML...")
+    # Step 1: 从 IDML 提取（含提取自检）
+    print("\n[1/5] 解析 IDML...")
     stories = extract_from_idml(idml_path)
     total_chars = sum(
         len(p['chars']) for s in stories for p in s['paragraphs']
@@ -801,18 +867,23 @@ def process(idml_path, result_path, output_path):
     print(f"  提取 {len(stories)} 个 Story, {total_chars} 个字符记录")
 
     # Step 2: 从句读结果提取
-    print("\n[2/4] 读取句读结果...")
+    print("\n[2/5] 读取句读结果...")
     result_chars = extract_from_result(result_path)
     punct_count = sum(1 for c in result_chars if c == '。')
     print(f"  提取 {len(result_chars)} 个字符（含 {punct_count} 个句号）")
 
     # Step 3: 验证并对齐
-    print("\n[3/4] 验证并对齐...")
+    print("\n[3/5] 验证并对齐...")
     grouped_records = validate_and_align(stories, result_chars)
 
     # Step 4: 生成输出
-    print("\n[4/4] 生成输出 IDML...")
+    print("\n[4/5] 生成输出 IDML...")
     generate_idml(idml_path, stories, grouped_records, output_path)
+
+    # Step 5: 输出自检 — 从生成的 IDML 重新提取并与输入比对
+    # 这是防止写入过程引入数据丢失的最后一道防线
+    print("\n[5/5] 验证输出 IDML...")
+    _verify_output(output_path, result_chars)
 
     print(f"\n{'=' * 60}")
     print(f"完成！输出文件: {output_path}")
