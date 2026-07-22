@@ -685,14 +685,21 @@ def _rebuild_paragraph_xml(
             continue
 
         if cdata['is_punct']:
-            # 旧句号 CSR：每个句号记录一个模板
+            # 旧句号 CSR：保留原 CSR 中的 Br，Content 用模板替换
+            orig_csr = cdata['match'].group(0)
+            has_br = '<Br' in orig_csr
             punct_segments = [t for is_p, t in segments if is_p]
             if not punct_segments:
-                csr_replacements[ci] = ''
+                # 无新句号 → 清空 Content，保留 Br
+                csr_replacements[ci] = _clear_content_keep_br(orig_csr) if has_br else ''
             elif punct_template:
-                csr_replacements[ci] = ''.join(
-                    punct_template for _ in punct_segments
-                )
+                fill = ''.join(punct_template for _ in punct_segments)
+                if has_br:
+                    # 模板可能无 Br → 在最后追加原 CSR 的 Br
+                    br_match = re.search(r'<Br\s*/>', orig_csr)
+                    if br_match and '<Br' not in fill:
+                        fill += br_match.group(0)
+                csr_replacements[ci] = fill
             continue
 
         # 文字 CSR：检查是否需要拆分
@@ -714,15 +721,21 @@ def _rebuild_paragraph_xml(
             )
         else:
             # 需要拆分：生成多个 CSR（文字 + 句号交错）
+            # Br 只放在第一个文本部分前面，后缀只放在最后一个文本部分
+            clean_prefix = re.sub(r'<Br\s*/>', '', csr_prefix)
+            clean_suffix = csr_xml[csr_xml.rfind('</CharacterStyleRange>'):]
+            non_punct_parts = [i for i, (is_p, _) in enumerate(segments) if not is_p]
             parts = []
-            for is_p, text in segments:
+            for i, (is_p, text) in enumerate(segments):
                 if is_p and punct_template:
                     parts.append(punct_template)
                 else:
+                    pfx = csr_prefix if i == non_punct_parts[0] else clean_prefix
+                    sfx = csr_suffix if i == non_punct_parts[-1] else clean_suffix
                     parts.append(
-                        csr_prefix
+                        pfx
                         + f'<Content>{_xml_escape(text)}</Content>'
-                        + csr_suffix
+                        + sfx
                     )
             csr_replacements[ci] = ''.join(parts)
 
@@ -807,6 +820,17 @@ def _insert_punct_csrs(
             result = result[:insert_pos] + tail + result[insert_pos:]
 
     return result
+
+
+def _clear_content_keep_br(csr_xml: str) -> str:
+    """清空 CSR 的 Content 文本，但保留 Br 和 CSR 结构。"""
+    # 将 <Content>...</Content> 替换为 <Content></Content>
+    return re.sub(
+        r'<Content>.*?</Content>',
+        '<Content></Content>',
+        csr_xml,
+        flags=re.DOTALL,
+    )
 
 
 def _rebuild_story_xml(header: str, para_xmls: list[str], footer: str) -> str:
