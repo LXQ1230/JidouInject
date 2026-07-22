@@ -534,17 +534,14 @@ def validate_and_align(stories: list[dict], result_chars: list[str]) -> dict:
 
     print(f"验证通过: {len(idml_compare_str)} 字一致")
 
-    # 对齐: 遍历句读结果，将非空白字符映射到对应 IDML 字符，
-    # 同时保留 IDML 中原有的空白字符（全角空格等）
-    idml_idx = 0           # 在 idml_clean_indices 中的位置
-    last_slot = None       # 段落归属 (story_idx, para_idx, csr_idx, content_slot)
-    last_text_csr = None   # 「。」插入的文本位置 (csr_idx) — 不更新到 ws 上
+    # 对齐: 遍历句读结果
+    idml_idx = 0
+    last_slot = None       # (story_idx, para_idx, csr_idx, content_slot)
     new_records: list[dict] = []
 
     for ch in result_chars:
         if ch == '。':
-            si, pi, _, _ = last_slot if last_slot else (0, 0, 0, 0)
-            ci = last_text_csr if last_text_csr is not None else 0
+            si, pi, ci, sl = last_slot if last_slot else (0, 0, 0, 0)
             new_records.append({
                 'char': '。',
                 'is_punct': True,
@@ -577,7 +574,6 @@ def validate_and_align(stories: list[dict], result_chars: list[str]) -> dict:
                 else:
                     last_slot = (orig_rec['story_idx'], orig_rec['para_idx'],
                                  orig_rec['csr_idx'], orig_rec['content_slot'])
-                    last_text_csr = orig_rec['csr_idx']
                     new_records.append({
                         'char': orig_rec['char'],
                         'is_punct': False,
@@ -681,12 +677,14 @@ def _rebuild_paragraph_xml(
             continue
 
         if cdata['is_punct']:
-            # 旧句号 CSR：句读结果有分配句号过来则填充，否则删除
-            has_punct = any(p for p, _ in segments)
-            if not has_punct:
+            # 旧句号 CSR：每个句号记录一个模板
+            punct_segments = [t for is_p, t in segments if is_p]
+            if not punct_segments:
                 csr_replacements[ci] = ''
             elif punct_template:
-                csr_replacements[ci] = punct_template
+                csr_replacements[ci] = ''.join(
+                    punct_template for _ in punct_segments
+                )
             continue
 
         # 文字 CSR：检查是否需要拆分
@@ -768,7 +766,10 @@ def _insert_punct_csrs(
     csr_idx = 0
     for csr_match in re.finditer(csr_pattern, xml, re.DOTALL):
         attrs = csr_match.group(1)
-        is_punct_csr = 'CharacterStyle/句号' in attrs
+        is_punct_csr = (
+            'CharacterStyle/句号' in attrs
+            or ''.join(slot_contents) == '。'
+        )
         end_pos = csr_match.end()
         csr_closes.append((csr_idx, end_pos, is_punct_csr))
         csr_idx += 1
