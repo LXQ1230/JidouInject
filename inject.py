@@ -280,12 +280,12 @@ def _verify_extraction(stories: list[dict], raw_story_xmls: dict[str, str]) -> N
 
         # 从解析器结果收集全部字符（与上述 raw_filtered 使用相同过滤规则）
         parsed_filtered: list[str] = []
-        for rec in story['paragraphs']:
-            for rec in rec['chars']:
+        for para in story['paragraphs']:
+            for rec in para['chars']:
                 ch = rec['char']
                 if rec.get('is_special', False):
                     continue
-                if rec['is_punct']:
+                if _is_old_punct(ch):
                     continue
                 if _is_unicode_whitespace(ch):
                     continue
@@ -390,7 +390,7 @@ def _parse_paragraph_style_range(
         for ch in content_text:
             chars.append({
                 'char': ch,
-                'is_punct': is_punct or _is_old_punct(ch),
+                'is_punct': _is_old_punct(ch),
                 'is_special': False,
                 'style': style_template,
                 'story_idx': story_idx,
