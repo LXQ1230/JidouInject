@@ -650,8 +650,12 @@ def _rebuild_paragraph_xml(
             ),
             'contents': contents,
         })
-        if csr_list[-1]['is_punct'] and csr_list[-1]['contents'] and punct_template is None:
-            punct_template = m.group(0)
+        if csr_list[-1]['is_punct'] and csr_list[-1]['contents']:
+            if punct_template is None:
+                punct_template = m.group(0)
+            elif '。</Content>' in m.group(0) and '。</Content>' not in punct_template:
+                # 优先使用 Content 为 。的模板（部分句号 CSR 的 Content 为空格）
+                punct_template = m.group(0)
         csr_idx += 1
 
     if punct_template is None:
