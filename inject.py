@@ -828,6 +828,10 @@ def _rebuild_paragraph_xml(
         content_end = csr_xml.rfind('</Content>') + len('</Content>')
         csr_prefix = csr_xml[:content_start]
         csr_suffix = csr_xml[content_end:]
+        # 分割副本的首字 CSR：剥离 leading Br
+        # 原单段落内部的换行不应出现在新段落开头
+        if is_split_copy and ci == min_text_idx:
+            csr_prefix = re.sub(r'<Br\s*/>', '', csr_prefix)
 
         orig_contents = cdata.get('contents', [])
         is_multi_content = len(orig_contents) > 1
@@ -1255,7 +1259,9 @@ def _verify_structure(
                     if not any(c.strip() for c in contents):
                         br_in_orig_empty += _count_br(m.group(0))
 
-    br_min = max(0, in_br_total - br_in_old_punct - br_in_orig_empty)
+    # 分割副本首字 leading Br 会被剥离，从下限中扣除
+    br_min = max(0, in_br_total - br_in_old_punct - br_in_orig_empty
+                 - len(split_sources))
 
     if out_br_total < br_min:
         errors.append(
