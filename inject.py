@@ -846,15 +846,6 @@ def _rebuild_paragraph_xml(
         csr_prefix = csr_xml[:content_start]
         csr_suffix = csr_xml[content_end:]
 
-        # C 规则：分割副本首字 CSR → 剥离 prefix Br + Group
-        # prefix Br 原是单段落内部换行，段首不适用
-        # Group 避免模板复制导致的 ID 重复
-        if is_split_copy and ci == min_text_idx:
-            csr_prefix = re.sub(r'<Br\s*/>', '', csr_prefix)
-            csr_prefix = re.sub(
-                r'<Group[^>]*>.*?</Group>', '', csr_prefix, flags=re.DOTALL
-            )
-
         orig_contents = cdata.get('contents', [])
         is_multi_content = len(orig_contents) > 1
         has_punct_inside = any(p for p, _ in segments)
@@ -1285,9 +1276,7 @@ def _verify_structure(
                     if not any(c.strip() for c in contents):
                         br_in_orig_empty += _count_br(m.group(0))
 
-    # C 规则会剥离分割副本首字的 prefix Br（最多 1 个/副本）
-    br_min = max(0, in_br_total - br_in_old_punct - br_in_orig_empty
-                 - len(split_sources))
+    br_min = max(0, in_br_total - br_in_old_punct - br_in_orig_empty)
 
     if out_br_total < br_min:
         errors.append(
