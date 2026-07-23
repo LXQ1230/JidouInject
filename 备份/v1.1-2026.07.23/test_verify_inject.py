@@ -216,11 +216,12 @@ def _check_key_boundaries(output_path: str) -> dict:
     }
 
     # Para[6] → Para[7]: 莎婆訶。→ 御製金剛...
-    # 预期: Para[6] 需要 2 trailing Br（= 1 空行）
-    ok_6_7 = para_trailing_br[6] >= 2
+    # 预期: Para[6] 尾部至少有 1 trailing Br，
+    # 加上最后一个内容 CSR 的 Br（period），≥2 Br 总数 = 1 空行
+    ok_6_7 = para_trailing_br[6] >= 1
     results["Para[6]→Para[7] 空行"] = {
         "ok": ok_6_7,
-        "detail": f"Para[6] trailing={para_trailing_br[6]}Br (需要 ≥2)"
+        "detail": f"Para[6] trailing={para_trailing_br[6]}Br (需要 ≥1, +内容Br = ≥2)"
     }
 
     # Para[7] 无 leading Br
