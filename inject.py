@@ -1203,55 +1203,56 @@ def _verify_structure(
         errors.append(f"Group Self ID 重复: {details}")
 
     # ---- 2: Br 数量合理性 ----
-    with zipfile.ZipFile(input_path, 'r') as zf:
-        in_xml = zf.read('Stories/Story_u15de.xml').decode('utf-8')
-    with zipfile.ZipFile(output_path, 'r') as zf:
-        out_xml = zf.read('Stories/Story_u15de.xml').decode('utf-8')
-
     def _count_br(xml: str) -> int:
         return xml.count('<Br />') + xml.count('<Br/>')
 
-    in_br = _count_br(in_xml)
-    out_br = _count_br(out_xml)
-
-    # 旧句号 CSR 的 Br（被清除）
     csr_pattern = (
         r'<CharacterStyleRange([^>]*?CharacterStyle/句号[^>]*?)>'
         r'.*?</CharacterStyleRange>'
     )
-    br_in_old_punct = sum(
-        _count_br(m.group(0))
-        for m in re.finditer(csr_pattern, in_xml, re.DOTALL)
-    )
 
-    # 原始段落中原本就为空的 CSR 的 Br（保留为段落装饰）
-    orig_psrs = list(re.finditer(
-        r'<ParagraphStyleRange[^>]*>.*?</ParagraphStyleRange>',
-        in_xml, re.DOTALL
-    ))
+    in_br_total = 0
+    out_br_total = 0
+    br_in_old_punct = 0
     br_in_orig_empty = 0
-    for psr in orig_psrs:
-        for m in re.finditer(
-            r'<CharacterStyleRange([^>]*?)(?:>(.*?)</CharacterStyleRange>|/>)',
-            psr.group(0), re.DOTALL
-        ):
-            contents = re.findall(
-                r'<Content>(.*?)</Content>', m.group(0), re.DOTALL
+
+    with zipfile.ZipFile(input_path, 'r') as in_zf, \
+         zipfile.ZipFile(output_path, 'r') as out_zf:
+        for name in in_zf.namelist():
+            if not name.startswith('Stories/Story_'):
+                continue
+            in_xml = in_zf.read(name).decode('utf-8')
+            out_xml = out_zf.read(name).decode('utf-8')
+
+            in_br_total += _count_br(in_xml)
+            out_br_total += _count_br(out_xml)
+
+            br_in_old_punct += sum(
+                _count_br(m.group(0))
+                for m in re.finditer(csr_pattern, in_xml, re.DOTALL)
             )
-            if not any(c.strip() for c in contents):
-                br_in_orig_empty += _count_br(m.group(0))
 
-    # 合理范围：
-    # - 最少：所有可移除 Br 都被清除
-    # - 最多：只清除旧句号 Br，其余全部保留
-    #   （分割后 CSR 拆分可能使 Br 从 csr_suffix 重分配到 punct CSR，
-    #     总数不变；但 trailing punct CSR 可能额外保留边界 Br）
-    br_min = max(0, in_br - br_in_old_punct - br_in_orig_empty)
-    br_max = in_br + br_in_orig_empty  # 上限宽松：只检查不会溢出太多
+            for psr in re.finditer(
+                r'<ParagraphStyleRange[^>]*>.*?</ParagraphStyleRange>',
+                in_xml, re.DOTALL
+            ):
+                for m in re.finditer(
+                    r'<CharacterStyleRange([^>]*?)(?:>'
+                    r'(.*?)</CharacterStyleRange>|/>)',
+                    psr.group(0), re.DOTALL
+                ):
+                    contents = re.findall(
+                        r'<Content>(.*?)</Content>',
+                        m.group(0), re.DOTALL
+                    )
+                    if not any(c.strip() for c in contents):
+                        br_in_orig_empty += _count_br(m.group(0))
 
-    if out_br < br_min:
+    br_min = max(0, in_br_total - br_in_old_punct - br_in_orig_empty)
+
+    if out_br_total < br_min:
         errors.append(
-            f"Br 丢失过多: 输入 {in_br} → 输出 {out_br} "
+            f"Br 丢失过多: 输入 {in_br_total} → 输出 {out_br_total} "
             f"（最低预期 {br_min}，旧句号清除 {br_in_old_punct}，"
             f"原始装饰 {br_in_orig_empty}）"
         )
@@ -1344,23 +1345,29 @@ def _verify_br_count(input_path: str, output_path: str) -> None:
     def _count_br(xml: str) -> int:
         return xml.count('<Br />') + xml.count('<Br/>')
 
-    with zipfile.ZipFile(input_path, 'r') as zf:
-        in_xml = zf.read('Stories/Story_u15de.xml').decode('utf-8')
-    with zipfile.ZipFile(output_path, 'r') as zf:
-        out_xml = zf.read('Stories/Story_u15de.xml').decode('utf-8')
-
-    # 输入中旧句号 CSR 的 Br 数（这些会被清除）
     csr_pattern = r'<CharacterStyleRange([^>]*?CharacterStyle/句号[^>]*?)>.*?</CharacterStyleRange>'
-    br_in_old_punct = sum(
-        _count_br(m.group(0))
-        for m in re.finditer(csr_pattern, in_xml, re.DOTALL)
-    )
 
-    in_br = _count_br(in_xml)
-    out_br = _count_br(out_xml)
-    br_cleared_text = in_br - br_in_old_punct - out_br
+    in_br_total = 0
+    out_br_total = 0
+    br_in_old_punct = 0
 
-    print(f"  Br 统计: 输入 {in_br} → 输出 {out_br}"
+    with zipfile.ZipFile(input_path, 'r') as in_zf, \
+         zipfile.ZipFile(output_path, 'r') as out_zf:
+        for name in in_zf.namelist():
+            if not name.startswith('Stories/Story_'):
+                continue
+            in_xml = in_zf.read(name).decode('utf-8')
+            out_xml = out_zf.read(name).decode('utf-8')
+            in_br_total += _count_br(in_xml)
+            out_br_total += _count_br(out_xml)
+            br_in_old_punct += sum(
+                _count_br(m.group(0))
+                for m in re.finditer(csr_pattern, in_xml, re.DOTALL)
+            )
+
+    br_cleared_text = in_br_total - br_in_old_punct - out_br_total
+
+    print(f"  Br 统计: 输入 {in_br_total} → 输出 {out_br_total}"
           f"（旧句号清除 {br_in_old_punct}, 清空文字 CSR 清除 {br_cleared_text}）")
 
 
