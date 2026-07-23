@@ -781,11 +781,12 @@ def _rebuild_paragraph_xml(
                     csr_replacements[ci] = _clear_content_strip_br(
                         orig_csr, strip_groups=True
                     )
-                elif ci > max_text_idx and not orig_had_content:
-                    # 原始段落尾部装饰 CSR（原本就无文字）→ 保留 Br
+                elif (ci > max_text_idx and ci <= max_text_idx + 3
+                      and not orig_had_content):
+                    # 紧邻内容尾部的空装饰 CSR → 保留 Br（段落尾装饰）
                     csr_replacements[ci] = _clear_content_keep_br(orig_csr)
                 elif ci > max_text_idx:
-                    # 原始段落尾部有内容的 CSR → 内容移走，剥离 Br
+                    # 远离内容的尾部 CSR → 内容移走，剥离 Br
                     csr_replacements[ci] = _clear_content_strip_br(orig_csr)
                 else:
                     # leading 或中间区域 → 剥离 Br，保留 Group
