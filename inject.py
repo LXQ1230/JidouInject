@@ -776,17 +776,19 @@ def _rebuild_paragraph_xml(
                     csr_replacements[ci] = ''
             else:
                 # 文字 CSR 无记录 → 清除 Content
-                if is_split_copy:
-                    # 分割副本：剥离 Br + Group（避免重复 ID 和多余换行）
+                if ci > max_text_idx and ci <= max_text_idx + 3 and not orig_had_content:
+                    # 紧邻内容尾部的空装饰 CSR → 保留 Br（段落尾装饰）
+                    # 无论是否分割副本，段落尾装饰都应保留
+                    csr_replacements[ci] = _clear_content_keep_br(
+                        orig_csr, strip_groups=is_split_copy
+                    )
+                elif is_split_copy:
+                    # 分割副本其他 CSR：剥离 Br + Group
                     csr_replacements[ci] = _clear_content_strip_br(
                         orig_csr, strip_groups=True
                     )
-                elif (ci > max_text_idx and ci <= max_text_idx + 3
-                      and not orig_had_content):
-                    # 紧邻内容尾部的空装饰 CSR → 保留 Br（段落尾装饰）
-                    csr_replacements[ci] = _clear_content_keep_br(orig_csr)
                 elif ci > max_text_idx:
-                    # 远离内容的尾部 CSR → 内容移走，剥离 Br
+                    # 原始段落尾部有内容的 CSR → 剥离 Br
                     csr_replacements[ci] = _clear_content_strip_br(orig_csr)
                 else:
                     # leading 或中间区域 → 剥离 Br，保留 Group
