@@ -828,11 +828,6 @@ def _rebuild_paragraph_xml(
         content_end = csr_xml.rfind('</Content>') + len('</Content>')
         csr_prefix = csr_xml[:content_start]
         csr_suffix = csr_xml[content_end:]
-        # 分割副本的首字 CSR：剥离 leading/trailing Br
-        # 原单段落内部的换行不应出现在新段落开头或首字之后
-        if is_split_copy and ci == min_text_idx:
-            csr_prefix = re.sub(r'<Br\s*/>', '', csr_prefix)
-            csr_suffix = re.sub(r'<Br\s*/>', '', csr_suffix)
 
         orig_contents = cdata.get('contents', [])
         is_multi_content = len(orig_contents) > 1
@@ -856,8 +851,9 @@ def _rebuild_paragraph_xml(
                     old_ctag = f'<Content>{orig_contents[oi]}</Content>'
                     new_ctag = f'<Content>{_xml_escape(part_text)}</Content>'
                     parts_xml = parts_xml.replace(old_ctag, new_ctag, 1)
-                # 分割副本首字：剥离多 Content 间的 Br
-                if is_split_copy and ci == min_text_idx:
+                # 分割副本：剥离多 Content 间的 Br
+                # （原单段落的节标题格式在分割后不再适用）
+                if is_split_copy:
                     parts_xml = re.sub(r'<Br\s*/>', '', parts_xml)
                 csr_replacements[ci] = parts_xml
             else:
@@ -1263,9 +1259,7 @@ def _verify_structure(
                     if not any(c.strip() for c in contents):
                         br_in_orig_empty += _count_br(m.group(0))
 
-    # 分割副本首字 CSR prefix+suffix Br 会被剥离
-    br_min = max(0, in_br_total - br_in_old_punct - br_in_orig_empty
-                 - len(split_sources) * 2)
+    br_min = max(0, in_br_total - br_in_old_punct - br_in_orig_empty)
 
     if out_br_total < br_min:
         errors.append(
