@@ -753,51 +753,68 @@ def _rebuild_paragraph_xml(
     min_text_idx = min(text_content_csrs) if text_content_csrs else 0
     max_text_idx = max(text_content_csrs) if text_content_csrs else len(csr_list) - 1
 
+    # 3.6 预扫描：找到紧邻内容的第一尾饰 CSR（A2 规则）
+    # 只在 max_text_idx 之后到第一个"曾有文字内容"的 CSR 之间搜索
+    first_trailing_decoration: int | None = None
+    for ci in range(max_text_idx + 1, len(csr_list)):
+        cdata = csr_list[ci]
+        if cdata['is_punct']:
+            continue
+        orig_had_text = any(
+            c.strip() for c in cdata.get('contents', [])
+        )
+        if orig_had_text:
+            break  # 遇到曾有文字的 CSR，不是装饰区
+        has_br = '<Br' in cdata['match'].group(0)
+        if has_br:
+            first_trailing_decoration = ci
+            break  # 找到第一个空+Br CSR，标记为紧邻尾饰
+
     # 4. 生成 CSR 级别的替换内容
     # csr_replacements: {csr_idx: replacement_xml_string}
+    #
+    # 无记录 CSR 的 Br 保留规则（优先级 A1→A2→A3→A4）：
+    #   A1. punct + trailing + 纯空白内容 + 有 Br → 保留（分隔符）
+    #   A2. text + close-trailing + 原为空 + 有 Br → 保留（尾饰）
+    #   A3. text + 分割副本 → 剥离 Br + Group
+    #   A4. 其他 → 剥离 Br
     csr_replacements: dict[int, str] = {}
     for ci, cdata in enumerate(csr_list):
         segments = csr_segments.get(ci, [])
         if not segments:
             orig_csr = cdata['match'].group(0)
             has_br = '<Br' in orig_csr
-            # 原始 CSR 是否曾有文字内容（用于区分装饰性 Br 和内容 Br）
-            orig_had_content = any(
+            is_trailing = ci > max_text_idx
+            is_close_trailing = (ci == first_trailing_decoration)
+            is_punct = cdata['is_punct']
+            orig_had_text = any(
                 c.strip() for c in cdata.get('contents', [])
             )
-            if cdata['is_punct']:
-                # 旧句号 CSR 无新句号 → 清除
-                # trailing 区域的 punct CSR：
-                #   - 原始内容为纯空白（如分隔符 CSR[29] 的两个空格）→ 保留 Br
-                #   - 原始内容为旧标点（如 '。'）→ 剥离 Br
-                orig_all_ws = all(
-                    not c.strip() for c in cdata.get('contents', [])
-                )
-                if has_br and ci > max_text_idx and orig_all_ws:
+            orig_all_ws = all(
+                not c.strip() for c in cdata.get('contents', [])
+            )
+
+            if is_punct:
+                # A1: 尾随 punct 分隔符（原始纯空白内容）→ 保留 Br
+                if has_br and is_trailing and orig_all_ws:
                     csr_replacements[ci] = _clear_content_keep_br(
                         orig_csr, strip_groups=is_split_copy
                     )
                 else:
                     csr_replacements[ci] = ''
+            elif is_close_trailing and not orig_had_text:
+                # A2: 紧邻内容尾部的空 CSR → 保留装饰 Br
+                csr_replacements[ci] = _clear_content_keep_br(
+                    orig_csr, strip_groups=is_split_copy
+                )
+            elif is_split_copy:
+                # A3: 分割副本 → 全部剥离
+                csr_replacements[ci] = _clear_content_strip_br(
+                    orig_csr, strip_groups=True
+                )
             else:
-                # 文字 CSR 无记录 → 清除 Content
-                if ci > max_text_idx and ci <= max_text_idx + 3 and not orig_had_content:
-                    # 紧邻内容尾部的空装饰 CSR → 保留 Br（段落尾装饰）
-                    # 无论是否分割副本，段落尾装饰都应保留
-                    csr_replacements[ci] = _clear_content_keep_br(
-                        orig_csr, strip_groups=is_split_copy
-                    )
-                elif is_split_copy:
-                    # 分割副本其他 CSR：剥离 Br + Group
-                    csr_replacements[ci] = _clear_content_strip_br(
-                        orig_csr, strip_groups=True
-                    )
-                elif ci > max_text_idx:
-                    # 原始段落尾部有内容的 CSR → 剥离 Br
-                    csr_replacements[ci] = _clear_content_strip_br(orig_csr)
-                else:
-                    # leading 或中间区域 → 剥离 Br，保留 Group
-                    csr_replacements[ci] = _clear_content_strip_br(orig_csr)
+                # A4: leading / 中间 / 远 trailing → 剥离 Br
+                csr_replacements[ci] = _clear_content_strip_br(orig_csr)
             continue
 
         if cdata['is_punct']:
@@ -828,6 +845,15 @@ def _rebuild_paragraph_xml(
         content_end = csr_xml.rfind('</Content>') + len('</Content>')
         csr_prefix = csr_xml[:content_start]
         csr_suffix = csr_xml[content_end:]
+
+        # C 规则：分割副本首字 CSR → 剥离 prefix Br + Group
+        # prefix Br 原是单段落内部换行，段首不适用
+        # Group 避免模板复制导致的 ID 重复
+        if is_split_copy and ci == min_text_idx:
+            csr_prefix = re.sub(r'<Br\s*/>', '', csr_prefix)
+            csr_prefix = re.sub(
+                r'<Group[^>]*>.*?</Group>', '', csr_prefix, flags=re.DOTALL
+            )
 
         orig_contents = cdata.get('contents', [])
         is_multi_content = len(orig_contents) > 1
@@ -1259,7 +1285,9 @@ def _verify_structure(
                     if not any(c.strip() for c in contents):
                         br_in_orig_empty += _count_br(m.group(0))
 
-    br_min = max(0, in_br_total - br_in_old_punct - br_in_orig_empty)
+    # C 规则会剥离分割副本首字的 prefix Br（最多 1 个/副本）
+    br_min = max(0, in_br_total - br_in_old_punct - br_in_orig_empty
+                 - len(split_sources))
 
     if out_br_total < br_min:
         errors.append(
