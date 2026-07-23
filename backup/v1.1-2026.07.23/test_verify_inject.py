@@ -14,7 +14,9 @@ import zipfile
 import re
 
 # 确保可以 import inject 模块
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+CODE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(CODE_DIR)
+sys.path.insert(0, CODE_DIR)
 
 from inject import (
     extract_from_idml, extract_from_result, validate_and_align,
@@ -22,12 +24,14 @@ from inject import (
     _verify_output,
 )
 
+SOURCE_DIR = os.path.join(PROJECT_ROOT, "source")
+
 
 def test_275():
     """275 经本专项测试"""
-    idml_path = "275导出.idml"
-    result_path = "275从ID中导出文字_WD句读结果.md"
-    output_path = "275导出_WD注入_test.idml"
+    idml_path = os.path.join(SOURCE_DIR, "275导出.idml")
+    result_path = os.path.join(SOURCE_DIR, "275从ID中导出文字_WD句读结果.md")
+    output_path = os.path.join(PROJECT_ROOT, "275导出_WD注入_test.idml")
 
     print("=" * 60)
     print("275 综合验证测试")
@@ -236,9 +240,9 @@ def _check_key_boundaries(output_path: str) -> dict:
 
 def test_461():
     """461 经本专项测试"""
-    idml_path = "461导出.idml"
-    result_path = "461从ID中导出文字_WD句读结果.md"
-    output_path = "461导出_WD注入_test.idml"
+    idml_path = os.path.join(SOURCE_DIR, "461导出.idml")
+    result_path = os.path.join(SOURCE_DIR, "461从ID中导出文字_WD句读结果.md")
+    output_path = os.path.join(PROJECT_ROOT, "461导出_WD注入_test.idml")
 
     print("\n" + "=" * 60)
     print("461 综合验证测试")
