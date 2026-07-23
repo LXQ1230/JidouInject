@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(claude plugins *)"
+      "Bash(claude plugins *)",
+      "Bash(rm -rf __pycache__)",
+      "Bash(rm -f \"275导出_WD注入_dbg\"*)"
     ]
   }
 }
