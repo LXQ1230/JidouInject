@@ -15,10 +15,11 @@ import re
 import shutil
 import time
 
-# 确保 code/ 在路径中，以便 import inject
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 sys.path.insert(0, SCRIPT_DIR)
+
+from inject import resolve_conflicts, _resolve_output_path
 
 PENDING_DIR = os.path.join(PROJECT_ROOT, "pending")
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "output")
@@ -36,9 +37,7 @@ def find_pairs():
     pairs = []
 
     for idml_file in sorted(idml_files):
-        # 提取前缀: "275导出.idml" → "275"
         prefix = idml_file.replace("导出.idml", "")
-        # 查找对应的句读结果
         md_candidates = [
             f for f in os.listdir(PENDING_DIR)
             if f.startswith(prefix) and f.endswith("句读结果.md")
@@ -46,27 +45,40 @@ def find_pairs():
         if not md_candidates:
             print(f"警告: {idml_file} 找不到对应句读结果，跳过")
             continue
-        if len(md_candidates) > 1:
-            print(f"警告: {idml_file} 匹配到多个句读结果: {md_candidates}，使用第一个")
-
         md_file = md_candidates[0]
         pairs.append((
             os.path.join(PENDING_DIR, idml_file),
             os.path.join(PENDING_DIR, md_file),
             prefix,
         ))
-
     return pairs
 
 
-def process_one(idml_path, result_path, name):
-    """处理单个文件对，返回 (成功, 耗时秒)"""
+def collect_conflicts(pairs):
+    """收集所有潜在的冲突"""
+    conflicts = {}
+    for _, _, name in pairs:
+        out_file = f"{name}导出_WD注入.idml"
+        # 输出文件
+        out_path = os.path.join(OUTPUT_DIR, out_file)
+        if os.path.exists(out_path):
+            conflicts[out_path] = f"output/ 输出文件"
+        # injected 汇总
+        inj_path = os.path.join(INJECTED_DIR, out_file)
+        if os.path.exists(inj_path):
+            conflicts[inj_path] = f"injected/ 汇总"
+        # done 归档
+        done_path = os.path.join(DONE_DIR, name, out_file)
+        if os.path.exists(done_path):
+            conflicts[done_path] = f"done/{name}/ 归档"
+        # pending 源文件不会冲突（本来就是从这里读的）
+    return conflicts
+
+
+def process_one(idml_path, result_path, name, output_path):
+    """处理单个文件对"""
     from inject import process
 
-    output_path = os.path.join(OUTPUT_DIR, f"{name}导出_WD注入.idml")
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    # 临时切换到项目根目录运行（inject.py 输出路径基于当前目录）
     old_cwd = os.getcwd()
     os.chdir(PROJECT_ROOT)
     try:
@@ -81,29 +93,52 @@ def process_one(idml_path, result_path, name):
         os.chdir(old_cwd)
 
 
-def archive(name):
-    """将 pending/ 中的输入文件 + output/ 中的输出文件归档到 done/ + injected/"""
+def archive(name, decisions):
+    """归档到 done/ + injected/"""
+    out_file = f"{name}导出_WD注入.idml"
+    out_src = os.path.join(OUTPUT_DIR, out_file)
     done_dir = os.path.join(DONE_DIR, name)
+
+    if not os.path.isfile(out_src):
+        print(f"  警告: 输出文件不存在 {out_src}")
+        return
+
     os.makedirs(done_dir, exist_ok=True)
 
-    # 移动 pending 中的输入文件
+    # output → injected
+    inj_dst = os.path.join(INJECTED_DIR, out_file)
+    _smart_copy(out_src, inj_dst, decisions.get(inj_dst, 'overwrite'))
+
+    # output → done
+    done_dst = os.path.join(done_dir, out_file)
+    _smart_move(out_src, done_dst, decisions.get(done_dst, 'overwrite'))
+
+    # pending 源文件 → done
     for f in os.listdir(PENDING_DIR):
         if f.startswith(name):
             src = os.path.join(PENDING_DIR, f)
-            shutil.move(src, os.path.join(done_dir, f))
+            dst = os.path.join(done_dir, f)
+            _smart_move(src, dst, decisions.get(dst, 'overwrite'))
 
-    # 复制 output → injected（永久保留）
-    output_file = f"{name}导出_WD注入.idml"
-    output_src = os.path.join(OUTPUT_DIR, output_file)
-    injected_dst = os.path.join(INJECTED_DIR, output_file)
-    if os.path.isfile(output_src):
-        shutil.copy2(output_src, injected_dst)
+    print(f"  已归档 → done/{name}/ + injected/")
 
-    # 移动 output → done
-    if os.path.isfile(output_src):
-        shutil.move(output_src, os.path.join(done_dir, output_file))
 
-    print(f"  已归档 → done/{name}/ + injected/{output_file}")
+def _smart_copy(src, dst, action):
+    """智能复制，处理冲突"""
+    if os.path.exists(dst):
+        dst = _resolve_output_path(dst, action)
+        if dst is None:
+            return
+    shutil.copy2(src, dst)
+
+
+def _smart_move(src, dst, action):
+    """智能移动，处理冲突"""
+    if os.path.exists(dst):
+        dst = _resolve_output_path(dst, action)
+        if dst is None:
+            return
+    shutil.move(src, dst)
 
 
 def main():
@@ -118,19 +153,50 @@ def main():
     for idml, md, name in pairs:
         print(f"  {name}: {os.path.basename(idml)} + {os.path.basename(md)}")
 
+    # ── 冲突检测 ──
+    conflicts = collect_conflicts(pairs)
+    decisions = resolve_conflicts(conflicts)
+
+    # ── 检查是否全部跳过 ──
+    out_file_skips = set()
+    for _, _, name in pairs:
+        out_path = os.path.join(OUTPUT_DIR, f"{name}导出_WD注入.idml")
+        if out_path in decisions and decisions[out_path] == 'skip':
+            out_file_skips.add(name)
+
+    # ── 处理 ──
     print(f"\n开始批量处理 ({len(pairs)} 对)...")
     print("=" * 60)
 
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     results = []
+
     for idml, md, name in pairs:
         print(f"\n[{name}]")
-        ok, elapsed = process_one(idml, md, name)
+
+        out_file = f"{name}导出_WD注入.idml"
+        out_path = os.path.join(OUTPUT_DIR, out_file)
+
+        # 冲突：跳过
+        if out_path in decisions and decisions[out_path] == 'skip':
+            print(f"  已跳过（output/ 同名文件）")
+            results.append((name, "-", "跳过"))
+            continue
+
+        # 冲突：重命名
+        if out_path in decisions and decisions[out_path] == 'rename_v2':
+            resolved = _resolve_output_path(out_path, 'rename_v2')
+            if resolved:
+                out_path = resolved
+
+        ok, elapsed = process_one(idml, md, name, out_path)
         if ok:
-            archive(name)
+            archive(name, decisions)
             results.append((name, "✓", f"{elapsed:.1f}s"))
         else:
             results.append((name, "✗", "-"))
 
+    # ── 汇总 ──
     print("\n" + "=" * 60)
     print("处理完成\n")
     print(f"{'文件':<15} {'状态':<5} {'耗时':<10}")

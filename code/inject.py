@@ -142,6 +142,78 @@ def _is_ws_for_compare(ch: str) -> bool:
     return False
 
 
+def resolve_conflicts(conflicts: dict[str, str]) -> dict[str, str]:
+    """冲突检测与处理。
+
+    Args:
+        conflicts: {路径: 描述} 映射，如 {'output/275导出_WD注入.idml': '输出文件'}
+
+    Returns:
+        {路径: 操作} 映射，操作: 'overwrite' | 'rename_v2' | 'skip'
+    """
+    if not conflicts:
+        return {}
+
+    print("\n[!] 检测到以下文件已存在：\n")
+    items = list(conflicts.items())
+    for i, (path, desc) in enumerate(items, 1):
+        print(f"  [{i}] {path}")
+        print(f"      {desc}")
+
+    print("\n请选择处理方式：")
+    print("  A  全部覆盖")
+    print("  S  全部跳过")
+    print("  R  全部自动重命名（加 _v2, _v3 后缀）")
+    print("  C  逐个确认")
+
+    while True:
+        choice = input("\n> ").strip().upper()
+        result: dict[str, str] = {}
+
+        if choice == 'A':
+            return {path: 'overwrite' for path in conflicts}
+        elif choice == 'S':
+            return {path: 'skip' for path in conflicts}
+        elif choice == 'R':
+            return {path: 'rename_v2' for path in conflicts}
+        elif choice == 'C':
+            for path, desc in items:
+                while True:
+                    sub = input(f"  {path}\n  [O]覆盖 [S]跳过 [R]重命名 [Q]取消全部 > ").strip().upper()
+                    if sub == 'O':
+                        result[path] = 'overwrite'
+                        break
+                    elif sub == 'S':
+                        result[path] = 'skip'
+                        break
+                    elif sub == 'R':
+                        result[path] = 'rename_v2'
+                        break
+                    elif sub == 'Q':
+                        print("  已取消")
+                        sys.exit(0)
+            return result
+        else:
+            print("  无效选项，请重新输入")
+
+
+def _resolve_output_path(path: str, action: str) -> str | None:
+    """根据冲突处理结果返回最终输出路径。
+
+    Returns:
+        最终路径，或 None 表示跳过
+    """
+    if action == 'skip':
+        return None
+    if action == 'rename_v2':
+        base, ext = os.path.splitext(path)
+        v = 2
+        while os.path.exists(f"{base}_v{v}{ext}"):
+            v += 1
+        return f"{base}_v{v}{ext}"
+    return path  # overwrite
+
+
 def main():
     parser = argparse.ArgumentParser(description="IDML 句读结果回注工具")
     parser.add_argument("--idml", required=True, help="原始 IDML 文件路径")
@@ -174,6 +246,16 @@ def main():
     print(f"输入 IDML: {args.idml}")
     print(f"句读结果: {args.result}")
     print(f"输出文件: {args.output}")
+
+    # 冲突检测
+    if os.path.exists(args.output):
+        conflicts = {args.output: "输出文件已存在"}
+        decisions = resolve_conflicts(conflicts)
+        resolved = _resolve_output_path(args.output, decisions[args.output])
+        if resolved is None:
+            print("已跳过")
+            sys.exit(0)
+        args.output = resolved
 
     try:
         process(args.idml, args.result, args.output)
