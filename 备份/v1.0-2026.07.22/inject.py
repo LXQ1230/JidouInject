@@ -430,20 +430,14 @@ def _get_story_footer(story_xml: str) -> str:
     return ''
 
 
-def extract_from_result(md_path: str) -> dict:
+def extract_from_result(md_path: str) -> list[str]:
     """
-    从句读结果 MD 文件提取字符序列和段落边界。
-
+    从句读结果 MD 文件提取字符序列。
     - 跳过文件头（# 标题到第一个 --- 之间的元数据）
-    - 忽略空格、制表符等 ASCII 空白字符
+    - 忽略换行、空格等 ASCII 空白字符
     - 保留可见字符（含「。」和全角空格 U+3000）
-    - 检测空行作为段落边界标记
 
-    返回: {
-        'chars': 字符列表，如 ['如', '是', '我', '聞', '。', '一', '時', '。', ...],
-        'para_breaks': set of int — chars 中的位置索引，表示段落边界
-                        （边界在位置 i 表示 chars[i] 是新段落的第一个字符）
-    }
+    返回: 字符列表，如 ['如', '是', '我', '聞', '。', '一', '時', '。', ...]
     """
     with open(md_path, 'r', encoding='utf-8') as f:
         content = f.read()
@@ -452,25 +446,14 @@ def extract_from_result(md_path: str) -> dict:
     parts = content.split('---', 1)
     body = parts[1] if len(parts) > 1 else content
 
-    # 逐行处理，检测空行作为段落边界
-    lines = body.replace('\r', '').split('\n')
-    chars: list[str] = []
-    para_breaks: set[int] = set()
+    # 仅过滤 ASCII 空白字符（空格、制表符、换行、回车）
+    # 保留全角空格 U+3000（佛经偈颂中的分字空格）等 Unicode 空白
+    chars = [ch for ch in body if ch not in '\n\r\t ']
 
-    for line in lines:
-        # 过滤空格和制表符（但保留全角空格 U+3000）
-        line_chars = [ch for ch in line if ch not in '\t ']
-        if line_chars:
-            chars.extend(line_chars)
-        else:
-            # 空行 → 段落边界标记（跳过文件开头的空行）
-            if chars:
-                para_breaks.add(len(chars))
-
-    return {'chars': chars, 'para_breaks': para_breaks}
+    return chars
 
 
-def validate_and_align(stories: list[dict], result_data: dict) -> dict:
+def validate_and_align(stories: list[dict], result_chars: list[str]) -> dict:
     """
     验证 IDML 净文字与句读结果净文字一致，然后执行字符级对齐。
 
@@ -478,14 +461,9 @@ def validate_and_align(stories: list[dict], result_data: dict) -> dict:
     - IDML 的非标点、非特殊标记字符在句读结果中必有对应
     - 句读结果中新增的「。」插入在对应位置，归属上一字符的段落
     - 对齐后的每个 new_record 都标记了所属的 (story_idx, para_idx)
-    - 句读结果中的空行（段落边界）会触发 IDML 段落分割：
-      边界位置的字符及其后续内容分配到新的虚拟段落
 
     返回: grouped_records，结构为 {story_idx: {para_idx: [records]}}
     """
-    result_chars: list[str] = result_data['chars']
-    para_breaks: set[int] = result_data['para_breaks']
-
     # 扁平化所有 IDML 字符记录
     # 跳过内容过少的故事（装饰性元素，如页眉标题、译者信息等）
     # 这些装饰故事的内容不在句读结果中，不应参与对齐
@@ -556,60 +534,23 @@ def validate_and_align(stories: list[dict], result_data: dict) -> dict:
 
     print(f"验证通过: {len(idml_compare_str)} 字一致")
 
-    # 对齐: 遍历句读结果
-    # 段落分割策略：
-    # - 每个原始段落有一个"当前有效 para_idx"，初始为原始 para_idx
-    # - 当遇到空行边界时，该原始段落的"当前有效 para_idx"切换到新的唯一索引
-    # - 这样分割产生的新字符不会与其他原始段落冲突
-    #
-    # 计算每个 story 的最大原始 para_idx 和初始有效索引
-    orig_para_max: dict[int, int] = {}
-    for rec in all_idml_records:
-        si = rec['story_idx']
-        pi = rec['para_idx']
-        if si not in orig_para_max:
-            orig_para_max[si] = pi
-        else:
-            orig_para_max[si] = max(orig_para_max[si], pi)
-
-    # current_effective[(si, pi)] = 此原始段落当前的 effective para_idx
-    current_effective: dict[tuple, int] = {}
-    # next_new_idx[si] = 下一个可分配的唯一 para_idx
-    next_new_idx: dict[int, int] = {}
-    # split_sources[(si, effective_pi)] = original_pi（仅非原始索引的段落）
-    new_split_sources: dict[tuple, int] = {}
-
-    for si, max_pi in orig_para_max.items():
-        next_new_idx[si] = max_pi + 1
-        for pi in range(max_pi + 1):
-            current_effective[(si, pi)] = pi
-
-    idml_idx = 0
-    last_slot = None       # (story_idx, para_idx, csr_idx, content_slot)
+    # 对齐: 遍历句读结果，将非空白字符映射到对应 IDML 字符，
+    # 同时保留 IDML 中原有的空白字符（全角空格等）
+    idml_idx = 0           # 在 idml_clean_indices 中的位置
+    last_slot = None       # 上一个字符的 (story_idx, para_idx, csr_idx, content_slot)
     new_records: list[dict] = []
 
-    for i, ch in enumerate(result_chars):
-        # 检测段落边界：切换当前原始段落的 effective para_idx
-        if i in para_breaks and i > 0:
-            if last_slot:
-                si, pi = last_slot[0], last_slot[1]
-                new_idx = next_new_idx.get(si, pi + 1)
-                current_effective[(si, pi)] = new_idx
-                new_split_sources[(si, new_idx)] = pi
-                next_new_idx[si] = new_idx + 1
-
+    for ch in result_chars:
         if ch == '。':
             si, pi, ci, sl = last_slot if last_slot else (0, 0, 0, 0)
-            effective_pi = current_effective.get((si, pi), pi)
             new_records.append({
                 'char': '。',
                 'is_punct': True,
                 'is_special': False,
                 'story_idx': si,
-                'para_idx': effective_pi,
-                'csr_idx': -1,
-                'content_slot': -1,
-                'after_csr': ci,
+                'para_idx': pi,
+                'csr_idx': ci,
+                'content_slot': sl,
             })
         elif _is_ws_for_compare(ch):
             pass
@@ -618,10 +559,6 @@ def validate_and_align(stories: list[dict], result_data: dict) -> dict:
                 target_idx = idml_clean_indices[idml_idx]
                 orig_rec = all_idml_records[target_idx]
                 idml_idx += 1
-                effective_pi = current_effective.get(
-                    (orig_rec['story_idx'], orig_rec['para_idx']),
-                    orig_rec['para_idx'],
-                )
                 if _is_ws_for_compare(orig_rec['char']):
                     last_slot = (orig_rec['story_idx'], orig_rec['para_idx'],
                                  orig_rec['csr_idx'], orig_rec['content_slot'])
@@ -630,7 +567,7 @@ def validate_and_align(stories: list[dict], result_data: dict) -> dict:
                         'is_punct': False,
                         'is_special': False,
                         'story_idx': orig_rec['story_idx'],
-                        'para_idx': effective_pi,
+                        'para_idx': orig_rec['para_idx'],
                         'csr_idx': orig_rec['csr_idx'],
                         'content_slot': orig_rec['content_slot'],
                     })
@@ -642,7 +579,7 @@ def validate_and_align(stories: list[dict], result_data: dict) -> dict:
                         'is_punct': False,
                         'is_special': False,
                         'story_idx': orig_rec['story_idx'],
-                        'para_idx': effective_pi,
+                        'para_idx': orig_rec['para_idx'],
                         'csr_idx': orig_rec['csr_idx'],
                         'content_slot': orig_rec['content_slot'],
                     })
@@ -662,7 +599,7 @@ def validate_and_align(stories: list[dict], result_data: dict) -> dict:
     punct_count = sum(1 for r in new_records if r['is_punct'])
     print(f"对齐完成: {len(new_records)} 个字符（含 {punct_count} 个句号）")
 
-    return {'grouped': grouped, 'split_sources': new_split_sources}
+    return grouped
 
 
 def _xml_escape(text: str) -> str:
@@ -681,332 +618,59 @@ def _xml_escape(text: str) -> str:
 
 
 def _rebuild_paragraph_xml(
-    original_psr_xml: str, new_char_records: list[dict],
-    global_punct_template: str | None = None,
-    is_split_copy: bool = False,
+    original_psr_xml: str, new_char_records: list[dict]
 ) -> str:
-    """用槽位追踪 + CSR 拆分的方式重建 ParagraphStyleRange XML。
+    """用槽位追踪的方式重建 ParagraphStyleRange XML。
 
-    当句读结果要求在同一个 CSR 内的两个字之间插入句号时，
-    自动将原 CSR 拆分为多段，句号独立插入其间。
-
-    Args:
-        is_split_copy: 该段落是否为分割产生的新段落（模板副本）。
-                       副本中的 Group 元素（有唯一 Self ID）必须清除
-                       以避免与原始段落中的同一 ID 冲突。
+    保留原始 PSR XML 的全部结构（Br、Properties 等），
+    仅替换各 <Content> 标签内的文本。
     """
     if not new_char_records:
         return original_psr_xml
 
-    # 1. 收集所有有效记录（文字 + 句号），排除空白标记
-    all_records = [r for r in new_char_records
-                   if not r.get('is_special', False)]
+    # 1. 按 (csr_idx, content_slot) 收集文本
+    slot_texts: dict[tuple, str] = {}
+    for rec in new_char_records:
+        if rec.get('is_special', False):
+            continue
+        key = (rec['csr_idx'], rec['content_slot'])
+        slot_texts[key] = slot_texts.get(key, '') + rec['char']
 
-    # 2. 扫描原始 PSR XML
+    # 2. 扫描原始 PSR XML，按 CSR 顺序确定 Content 槽位顺序
     csr_pattern = r'<CharacterStyleRange([^>]*?)(?:>(.*?)</CharacterStyleRange>|/>)'
-    csr_list: list[dict] = []  # [{csr_idx, match_obj, is_punct, contents}]
-    punct_template: str | None = None
+    slot_order: list[tuple] = []  # [(csr_idx, slot_idx), ...]
     csr_idx = 0
-    for m in re.finditer(csr_pattern, original_psr_xml, re.DOTALL):
-        inner = m.group(2) or ''
-        contents = re.findall(r'<Content>(.*?)</Content>', inner, re.DOTALL)
-        csr_list.append({
-            'idx': csr_idx,
-            'match': m,
-            'is_punct': (
-                'CharacterStyle/句号' in m.group(1)
-                or ''.join(contents) == '。'
-            ),
-            'contents': contents,
-        })
-        if csr_list[-1]['is_punct'] and csr_list[-1]['contents']:
-            tmpl_xml = m.group(0)
-            if '<Br' in tmpl_xml:
-                tmpl_xml = re.sub(r'<Br\s*/>', '', tmpl_xml)  # 去 Br
-            if punct_template is None:
-                punct_template = tmpl_xml
-            elif '。</Content>' in tmpl_xml and '。</Content>' not in punct_template:
-                punct_template = tmpl_xml
-        csr_idx += 1
-
-    if punct_template is None or '。</Content>' not in punct_template:
-        punct_template = global_punct_template
-
-    # 3. 将记录按 csr_idx 分组（含句号：after_csr 指向它跟随的文字 CSR）
-    # csr_texts: {csr_idx: [(is_punct, text), ...]} — 保持原始顺序
-    csr_segments: dict[int, list[tuple[bool, str]]] = {}
-    for rec in all_records:
-        if rec.get('is_punct', False):
-            ci = rec.get('after_csr', -1)
-        else:
-            ci = rec['csr_idx']
-        if ci < 0:
-            continue
-        is_p = rec.get('is_punct', False)
-        csr_segments.setdefault(ci, []).append((is_p, rec['char']))
-
-    # 3.5 确定文字内容 CSR 的范围（用于区分 leading/trailing 清除区域）
-    text_content_csrs = {
-        ci for ci, segs in csr_segments.items()
-        if any(not is_p for is_p, _ in segs) and not csr_list[ci]['is_punct']
-    }
-    min_text_idx = min(text_content_csrs) if text_content_csrs else 0
-    max_text_idx = max(text_content_csrs) if text_content_csrs else len(csr_list) - 1
-
-    # 4. 生成 CSR 级别的替换内容
-    # csr_replacements: {csr_idx: replacement_xml_string}
-    csr_replacements: dict[int, str] = {}
-    for ci, cdata in enumerate(csr_list):
-        segments = csr_segments.get(ci, [])
-        if not segments:
-            orig_csr = cdata['match'].group(0)
-            has_br = '<Br' in orig_csr
-            # 原始 CSR 是否曾有文字内容（用于区分装饰性 Br 和内容 Br）
-            orig_had_content = any(
-                c.strip() for c in cdata.get('contents', [])
-            )
-            if cdata['is_punct']:
-                # 旧句号 CSR 无新句号 → 清除
-                # trailing 区域的 punct CSR 保留 Br（如分隔符 CSR[29]）
-                if has_br and ci > max_text_idx:
-                    csr_replacements[ci] = _clear_content_keep_br(
-                        orig_csr, strip_groups=is_split_copy
-                    )
-                else:
-                    csr_replacements[ci] = ''
-            else:
-                # 文字 CSR 无记录 → 清除 Content
-                if is_split_copy:
-                    # 分割副本：剥离 Br + Group（避免重复 ID 和多余换行）
-                    csr_replacements[ci] = _clear_content_strip_br(
-                        orig_csr, strip_groups=True
-                    )
-                elif ci > max_text_idx and not orig_had_content:
-                    # 原始段落尾部装饰 CSR（原本就无文字）→ 保留 Br
-                    csr_replacements[ci] = _clear_content_keep_br(orig_csr)
-                elif ci > max_text_idx:
-                    # 原始段落尾部有内容的 CSR → 内容移走，剥离 Br
-                    csr_replacements[ci] = _clear_content_strip_br(orig_csr)
-                else:
-                    # leading 或中间区域 → 剥离 Br，保留 Group
-                    csr_replacements[ci] = _clear_content_strip_br(orig_csr)
-            continue
-
-        if cdata['is_punct']:
-            # 旧句号 CSR：保留原 CSR 中的 Br，Content 用模板替换
-            orig_csr = cdata['match'].group(0)
-            has_br = '<Br' in orig_csr
-            punct_segments = [t for is_p, t in segments if is_p]
-            if not punct_segments:
-                # 无新句号 → 清空 Content
-                csr_replacements[ci] = (
-                    _clear_content_keep_br(orig_csr, strip_groups=is_split_copy)
-                    if has_br else ''
-                )
-            elif punct_template:
-                fill = ''.join(punct_template for _ in punct_segments)
-                if has_br:
-                    # 模板可能无 Br → 在最后追加原 CSR 的 Br
-                    br_match = re.search(r'<Br\s*/>', orig_csr)
-                    if br_match and '<Br' not in fill:
-                        fill += br_match.group(0)
-                csr_replacements[ci] = fill
-            continue
-
-        # 文字 CSR：检查是否需要拆分
-        match = cdata['match']
-        csr_xml = match.group(0)
-        content_start = csr_xml.find('<Content>')
-        content_end = csr_xml.rfind('</Content>') + len('</Content>')
-        csr_prefix = csr_xml[:content_start]
-        csr_suffix = csr_xml[content_end:]
-
-        orig_contents = cdata.get('contents', [])
-        is_multi_content = len(orig_contents) > 1
-        has_punct_inside = any(p for p, _ in segments)
-
-        if is_multi_content:
-            # 多 Content CSR：按原 Content 数量比例分配文字（含句号）
-            orig_lens = [len(c) for c in orig_contents]
-            total_orig = sum(orig_lens)
-            new_text = ''.join(t for _, t in segments)
-            if total_orig > 0:
-                parts_xml = csr_xml
-                pos = 0
-                for oi, ol in enumerate(orig_lens):
-                    if oi == len(orig_contents) - 1:
-                        share = len(new_text) - pos
-                    else:
-                        share = max(1, len(new_text) * ol // total_orig)
-                    part_text = new_text[pos:pos + share]
-                    pos += share
-                    old_ctag = f'<Content>{orig_contents[oi]}</Content>'
-                    new_ctag = f'<Content>{_xml_escape(part_text)}</Content>'
-                    parts_xml = parts_xml.replace(old_ctag, new_ctag, 1)
-                csr_replacements[ci] = parts_xml
-            else:
-                csr_replacements[ci] = csr_xml
-            continue
-
-        if not has_punct_inside:
-            # 单 Content、无拆分：全部文字合并
-            text = ''.join(t for _, t in segments)
-            csr_replacements[ci] = (
-                csr_prefix
-                + f'<Content>{_xml_escape(text)}</Content>'
-                + csr_suffix
-            )
-        else:
-            # 需要拆分：生成多个 CSR（文字 + 句号交错）
-            # - csr_prefix（含 Br/Group）仅给第一个文本部分
-            # - csr_suffix（含 Br）放在所有部分末尾
-            # - 中间的文本部分和句号部分用干净前后缀
-            #   （剥离 Br 避免多余换行，剥离 Group 避免重复 ID）
-            clean_prefix = re.sub(r'<Br\s*/>', '', csr_prefix)
-            clean_prefix = re.sub(
-                r'<Group[^>]*>.*?</Group>', '', clean_prefix, flags=re.DOTALL
-            )
-            clean_suffix = csr_xml[csr_xml.rfind('</CharacterStyleRange>'):]
-            non_punct_parts = [i for i, (is_p, _) in enumerate(segments) if not is_p]
-            parts = []
-            for i, (is_p, text) in enumerate(segments):
-                if is_p and punct_template:
-                    parts.append(punct_template)
-                else:
-                    pfx = csr_prefix if i == non_punct_parts[0] else clean_prefix
-                    parts.append(
-                        pfx
-                        + f'<Content>{_xml_escape(text)}</Content>'
-                        + clean_suffix
-                    )
-            # 后缀加在整个拆分序列末尾
-            parts[-1] = parts[-1].replace(clean_suffix, csr_suffix)
-            csr_replacements[ci] = ''.join(parts)
-
-    # 5. 应用替换：从后往前
-    result = original_psr_xml
-    for ci in range(len(csr_list) - 1, -1, -1):
-        cdata = csr_list[ci]
-        if ci not in csr_replacements:
-            continue
-        repl = csr_replacements[ci]
-        match = cdata['match']
-        result = result[:match.start()] + repl + result[match.end():]
-
-    return result
-
-
-def _remove_empty_punct_csrs(xml: str, csr_pattern: str) -> str:
-    """删除 Content 为空的句号 CSR。"""
-    result = xml
-    # 从后往前删除，避免位置偏移
-    for m in reversed(list(re.finditer(csr_pattern, xml, re.DOTALL))):
-        attrs = m.group(1)
-        if 'CharacterStyle/句号' not in attrs:
-            continue
-        contents = re.findall(r'<Content>(.*?)</Content>', m.group(0), re.DOTALL)
-        if all(c == '' for c in contents):
-            result = result[:m.start()] + result[m.end():]
-    return result
-
-
-def _insert_punct_csrs(
-    xml: str, punct_records: list[dict], template: str
-) -> str:
-    """将句号 CSR 插入到 XML 中对应 text CSR 之后。"""
-    # 按 after_csr 分组，从后往前插入，保持位置稳定
-    punct_after: dict[int, list[dict]] = {}
-    for prec in punct_records:
-        ci = prec.get('after_csr', -1)
-        if ci < 0:
-            continue
-        punct_after.setdefault(ci, []).append(prec)
-
-    if not punct_after:
-        return xml
-
-    # 找到每个 csr_idx 对应的 </CharacterStyleRange> 位置
-    csr_pattern = r'<CharacterStyleRange([^>]*?)(?:>(.*?)</CharacterStyleRange>|/>)'
-    csr_closes = []  # [(csr_idx, close_pos), ...]
-    csr_idx = 0
-    for csr_match in re.finditer(csr_pattern, xml, re.DOTALL):
-        attrs = csr_match.group(1)
-        is_punct_csr = (
-            'CharacterStyle/句号' in attrs
-            or ''.join(slot_contents) == '。'
+    for csr_match in re.finditer(csr_pattern, original_psr_xml, re.DOTALL):
+        inner = csr_match.group(2) or ''
+        slot_contents = re.findall(
+            r'<Content>(.*?)</Content>', inner, re.DOTALL
         )
-        end_pos = csr_match.end()
-        csr_closes.append((csr_idx, end_pos, is_punct_csr))
+        for slot_idx in range(len(slot_contents)):
+            slot_order.append((csr_idx, slot_idx))
         csr_idx += 1
 
-    # 从后往前插入
-    result = xml
-    for ci in sorted(punct_after.keys(), reverse=True):
-        # 找到 csr_idx=ci 的 CSR 结束位置。跳过旧句号 CSR（已被清空）
-        close_pos = None
-        for idx, pos, is_punct in csr_closes:
-            if idx == ci:
-                close_pos = pos
-                break
-        if close_pos is None:
-            continue
-        # 在 close_pos 处插入该 csr 后跟的所有句号 CSR
-        tail = ''.join(template for _ in punct_after[ci])
-        result = result[:close_pos] + tail + result[close_pos:]
-
-    # 处理 after_csr=-1 的句号（应该没有），放末尾
-    overflow = [p for p in punct_records if p.get('after_csr', -1) < 0]
-    if overflow:
-        tail = ''.join(template for _ in overflow)
-        last_close = result.rfind('</CharacterStyleRange>')
-        if last_close >= 0:
-            insert_pos = result.find('>', last_close) + 1
-            result = result[:insert_pos] + tail + result[insert_pos:]
-
-    return result
-
-
-def _clear_content_keep_br(csr_xml: str, strip_groups: bool = False) -> str:
-    """清空 CSR 的 Content 文本，保留 Br 标签和 CSR 结构。
-
-    用于段落分割后 trailing 区域的清理：Br 标签保留以确保
-    分割段落尾部保留原始换行（如空行分隔符）。
-
-    Args:
-        strip_groups: 是否同时移除 Group 元素（分割副本需设为 True
-                      以避免重复 Self ID）。
-    """
-    result = csr_xml
-    if strip_groups:
-        result = re.sub(r'<Group[^>]*>.*?</Group>', '', result, flags=re.DOTALL)
-    result = re.sub(
-        r'<Content>.*?</Content>',
-        '<Content></Content>',
-        result,
-        flags=re.DOTALL,
+    # 3. 逐个替换 Content 文本
+    # 使用位置偏移量方案：先收集所有替换（start, end, new_tag），
+    # 再从后往前执行替换。这样前面的替换不会影响后面替换的位置。
+    content_matches = list(
+        re.finditer(r'<Content>(.*?)</Content>', original_psr_xml, re.DOTALL)
     )
-    return result
 
+    replacements = []  # [(start_pos, end_pos, new_tag), ...]
+    for i, old_match in enumerate(content_matches):
+        if i < len(slot_order):
+            key = slot_order[i]
+            new_text = slot_texts.get(key, '')
+        else:
+            new_text = ''
+        new_tag = f'<Content>{_xml_escape(new_text)}</Content>'
+        replacements.append((old_match.start(), old_match.end(), new_tag))
 
-def _clear_content_strip_br(csr_xml: str, strip_groups: bool = False) -> str:
-    """清空 CSR 的 Content 文本、移除 Br，保留基本 CSR 结构。
+    # 从后往前替换，位置不受前面替换影响
+    result = original_psr_xml
+    for start, end, new_tag in reversed(replacements):
+        result = result[:start] + new_tag + result[end:]
 
-    用于段落分割后 leading 区域的清理：
-    - Br 标签不应出现在新段落开头（会造成多余空行）
-
-    Args:
-        strip_groups: 是否同时移除 Group 元素（分割副本需设为 True
-                      以避免重复 Self ID）。
-    """
-    result = re.sub(r'<Br\s*/>', '', csr_xml)
-    if strip_groups:
-        result = re.sub(r'<Group[^>]*>.*?</Group>', '', result, flags=re.DOTALL)
-    result = re.sub(
-        r'<Content>.*?</Content>',
-        '<Content></Content>',
-        result,
-        flags=re.DOTALL,
-    )
     return result
 
 
@@ -1058,7 +722,6 @@ def generate_idml(
     idml_path: str,
     stories: list[dict],
     grouped_records: dict,
-    split_sources: dict,
     output_path: str,
 ) -> None:
     """将新字符记录写回 IDML。
@@ -1075,83 +738,29 @@ def generate_idml(
         stories: extract_from_idml() 返回的 stories 列表。
         grouped_records: validate_and_align() 返回的分组记录字典。
             grouped_records[story_idx][para_idx] = 该段落的新字符记录列表。
-        split_sources: dict mapping (story_idx, effective_para_idx) → original_para_idx
-            指示分割产生的新段落的来源段落。
         output_path: 输出 IDML 文件的路径。
     """
     # 复制原始 IDML
     shutil.copy2(idml_path, output_path)
 
-    # 查找全局句号 CSR 模板（用于没有原句号 CSR 的段落）
-    global_punct_template: str | None = None
-    for story in stories:
-        for para in story['paragraphs']:
-            csr_pattern = (
-                r'<CharacterStyleRange([^>]*?CharacterStyle/句号[^>]*?)>'
-                r'.*?</CharacterStyleRange>'
-            )
-            tm = re.search(csr_pattern, para['raw_xml'], re.DOTALL)
-            if tm:
-                global_punct_template = tm.group(0)
-                break
-        if global_punct_template:
-            break
-
     new_story_xmls: dict[str, str] = {}
     para_rebuilt_count = 0
     para_unchanged_count = 0
-    para_split_count = 0
 
     for story_idx, story in enumerate(stories):
-        meta = grouped_records.get(story_idx, {})
-        max_orig_para_idx = len(story['paragraphs'])
+        story_xml_parts: list[str] = []
 
-        # 构建 (position, para_xml) 列表用于排序
-        # position: 原始段落用 para_idx，分割段落用 source_para_idx + 0.5
-        positioned_parts: list[tuple[float, str]] = []
-
-        # 处理原始段落
         for para_idx, para in enumerate(story['paragraphs']):
-            para_records = meta.get(para_idx, [])
+            para_records = grouped_records.get(story_idx, {}).get(para_idx, [])
 
             if para_records:
-                new_psr_xml = _rebuild_paragraph_xml(
-                    para['raw_xml'], para_records, global_punct_template
-                )
+                new_psr_xml = _rebuild_paragraph_xml(para['raw_xml'], para_records)
                 para_rebuilt_count += 1
             else:
                 new_psr_xml = para['raw_xml']
                 para_unchanged_count += 1
 
-            positioned_parts.append((float(para_idx), new_psr_xml))
-
-        # 处理因空行边界而分割出的新段落（para_idx >= max_orig_para_idx）
-        extra_para_indices = sorted(
-            [pi for pi in meta if pi >= max_orig_para_idx]
-        )
-        for para_idx in extra_para_indices:
-            para_records = meta[para_idx]
-            # 找到分割来源段落，使用其 raw_xml 作为模板
-            source_key = (story_idx, para_idx)
-            source_para_idx = split_sources.get(source_key)
-            if source_para_idx is not None and source_para_idx < len(story['paragraphs']):
-                template_xml = story['paragraphs'][source_para_idx]['raw_xml']
-                # 新段落插入到源段落之后（position = source + 0.5）
-                position = float(source_para_idx) + 0.5
-            else:
-                # 回退：使用最后一个段落作为模板，放在末尾
-                template_xml = story['paragraphs'][-1]['raw_xml']
-                position = float(len(story['paragraphs']))
-            new_psr_xml = _rebuild_paragraph_xml(
-                template_xml, para_records, global_punct_template,
-                is_split_copy=True,
-            )
-            positioned_parts.append((position, new_psr_xml))
-            para_split_count += 1
-
-        # 按位置排序
-        positioned_parts.sort(key=lambda x: x[0])
-        story_xml_parts = [pxml for _, pxml in positioned_parts]
+            story_xml_parts.append(new_psr_xml)
 
         new_story_xmls[story['name']] = _rebuild_story_xml(
             story['xml_header'],
@@ -1159,208 +768,9 @@ def generate_idml(
             story['xml_footer'],
         )
 
-    print(f"  重建 {para_rebuilt_count} 个段落，{para_unchanged_count} 个段落保持不变，"
-          f"{para_split_count} 个新段落（来自分割）")
+    print(f"  重建 {para_rebuilt_count} 个段落，{para_unchanged_count} 个段落保持不变")
 
     _write_stories_to_idml(output_path, new_story_xmls)
-
-
-def _verify_structure(
-    input_path: str, output_path: str,
-    stories: list[dict], split_sources: dict,
-    grouped_records: dict,
-) -> None:
-    """输出 IDML 结构完整性验证（在写入 ZIP 后、返回前调用）。
-
-    检查项：
-    1. Group Self ID 全局唯一（防止模板复制导致的重复 ID）
-    2. Br 数量在合理范围内（防止大量丢失或多余）
-    3. 分割段落无 leading Br（防止段首空行/隐形字符）
-    4. 段落数一致性
-    5. 所有文字 Content 可被正确解析
-
-    任何检查失败都会删除输出文件并抛出 ValueError。
-    """
-    errors: list[str] = []
-
-    # ---- 1: Group Self ID 唯一性 ----
-    group_ids: dict[str, list[str]] = {}  # {id: [story_name, ...]}
-    with zipfile.ZipFile(output_path, 'r') as zf:
-        for name in zf.namelist():
-            if not name.startswith('Stories/Story_'):
-                continue
-            xml = zf.read(name).decode('utf-8')
-            for gid in re.findall(r'Self="([^"]+)"', xml):
-                group_ids.setdefault(gid, []).append(name)
-
-    dup_groups = {gid: stories for gid, stories in group_ids.items()
-                  if len(stories) > 1}
-    if dup_groups:
-        details = ', '.join(
-            f'{gid}(×{len(s)})' for gid, s in dup_groups.items()
-        )
-        errors.append(f"Group Self ID 重复: {details}")
-
-    # ---- 2: Br 数量合理性 ----
-    with zipfile.ZipFile(input_path, 'r') as zf:
-        in_xml = zf.read('Stories/Story_u15de.xml').decode('utf-8')
-    with zipfile.ZipFile(output_path, 'r') as zf:
-        out_xml = zf.read('Stories/Story_u15de.xml').decode('utf-8')
-
-    def _count_br(xml: str) -> int:
-        return xml.count('<Br />') + xml.count('<Br/>')
-
-    in_br = _count_br(in_xml)
-    out_br = _count_br(out_xml)
-
-    # 旧句号 CSR 的 Br（被清除）
-    csr_pattern = (
-        r'<CharacterStyleRange([^>]*?CharacterStyle/句号[^>]*?)>'
-        r'.*?</CharacterStyleRange>'
-    )
-    br_in_old_punct = sum(
-        _count_br(m.group(0))
-        for m in re.finditer(csr_pattern, in_xml, re.DOTALL)
-    )
-
-    # 原始段落中原本就为空的 CSR 的 Br（保留为段落装饰）
-    orig_psrs = list(re.finditer(
-        r'<ParagraphStyleRange[^>]*>.*?</ParagraphStyleRange>',
-        in_xml, re.DOTALL
-    ))
-    br_in_orig_empty = 0
-    for psr in orig_psrs:
-        for m in re.finditer(
-            r'<CharacterStyleRange([^>]*?)(?:>(.*?)</CharacterStyleRange>|/>)',
-            psr.group(0), re.DOTALL
-        ):
-            contents = re.findall(
-                r'<Content>(.*?)</Content>', m.group(0), re.DOTALL
-            )
-            if not any(c.strip() for c in contents):
-                br_in_orig_empty += _count_br(m.group(0))
-
-    # 合理范围：
-    # - 最少：所有可移除 Br 都被清除
-    # - 最多：只清除旧句号 Br，其余全部保留
-    #   （分割后 CSR 拆分可能使 Br 从 csr_suffix 重分配到 punct CSR，
-    #     总数不变；但 trailing punct CSR 可能额外保留边界 Br）
-    br_min = max(0, in_br - br_in_old_punct - br_in_orig_empty)
-    br_max = in_br + br_in_orig_empty  # 上限宽松：只检查不会溢出太多
-
-    if out_br < br_min:
-        errors.append(
-            f"Br 丢失过多: 输入 {in_br} → 输出 {out_br} "
-            f"（最低预期 {br_min}，旧句号清除 {br_in_old_punct}，"
-            f"原始装饰 {br_in_orig_empty}）"
-        )
-
-    # ---- 3: 分割段落无 leading Br ----
-    with zipfile.ZipFile(output_path, 'r') as zf:
-        story_xmls = {}
-        for name in zf.namelist():
-            if name.startswith('Stories/Story_'):
-                story_xmls[name] = zf.read(name).decode('utf-8')
-
-    for (si, new_pi), orig_pi in split_sources.items():
-        story_name = f'Stories/Story_{stories[si]["name"]}.xml'
-        if story_name not in story_xmls:
-            continue
-        xml = story_xmls[story_name]
-        psrs = list(re.finditer(
-            r'<ParagraphStyleRange[^>]*>.*?</ParagraphStyleRange>',
-            xml, re.DOTALL
-        ))
-        # 找到这个分割段落（position = orig_pi + 0.5）
-        # 简化：遍历所有段落，找 leading Br
-        for i, psr in enumerate(psrs):
-            csrs = list(re.finditer(
-                r'<CharacterStyleRange([^>]*?)(?:>(.*?)</CharacterStyleRange>|/>)',
-                psr.group(0), re.DOTALL
-            ))
-            first_content = None
-            for j, m in enumerate(csrs):
-                inner = m.group(2) or ''
-                c = re.findall(r'<Content>(.*?)</Content>', inner, re.DOTALL)
-                if any(t.strip() for t in c):
-                    first_content = j
-                    break
-            if first_content is None:
-                continue
-            for j in range(first_content):
-                if '<Br' in csrs[j].group(0):
-                    errors.append(
-                        f"分割段落 Para[{i}] CSR[{j}] 存在 leading Br"
-                    )
-
-    # ---- 4: 段落数一致性（仅统计有注入操作的 Story） ----
-    expected_paras = 0
-    actual_total = 0
-    for story_idx, story in enumerate(stories):
-        meta = grouped_records.get(story_idx, {})
-        if not meta:
-            continue  # 无注入操作的 Story 跳过
-        expected_paras += len(story['paragraphs'])
-        # 加上这个 Story 的分割段落
-        max_orig = len(story['paragraphs'])
-        extras = [pi for pi in meta if pi >= max_orig]
-        expected_paras += len(extras)
-
-        story_path = f"Stories/Story_{story['name']}.xml"
-        if story_path in story_xmls:
-            actual_total += len(re.findall(
-                r'<ParagraphStyleRange[^>]*>',
-                story_xmls[story_path], re.DOTALL
-            ))
-
-    if actual_total != expected_paras:
-        errors.append(
-            f"段落数不一致: 预期 {expected_paras}, 实际 {actual_total}"
-        )
-
-    # ---- 判断 ----
-    if errors:
-        try:
-            os.remove(output_path)
-        except OSError:
-            pass
-        raise ValueError(
-            "输出 IDML 结构验证失败！\n"
-            + "\n".join(f"  • {e}" for e in errors)
-            + f"\n（输出文件已删除: {output_path}）"
-        )
-
-
-def _verify_br_count(input_path: str, output_path: str) -> None:
-    """报告输入/输出 IDML 的 Br 数量变化。
-
-    预期变化：
-    1. 旧句号 CSR 的 Br → 清除（句号由新 punct 模板接管）
-    2. 被清空的文字 CSR 的 Br → 清除（段落分割后原 Br 不重复保留）
-
-    字符级输出验证（_verify_output）是真正的质量保证。
-    """
-    def _count_br(xml: str) -> int:
-        return xml.count('<Br />') + xml.count('<Br/>')
-
-    with zipfile.ZipFile(input_path, 'r') as zf:
-        in_xml = zf.read('Stories/Story_u15de.xml').decode('utf-8')
-    with zipfile.ZipFile(output_path, 'r') as zf:
-        out_xml = zf.read('Stories/Story_u15de.xml').decode('utf-8')
-
-    # 输入中旧句号 CSR 的 Br 数（这些会被清除）
-    csr_pattern = r'<CharacterStyleRange([^>]*?CharacterStyle/句号[^>]*?)>.*?</CharacterStyleRange>'
-    br_in_old_punct = sum(
-        _count_br(m.group(0))
-        for m in re.finditer(csr_pattern, in_xml, re.DOTALL)
-    )
-
-    in_br = _count_br(in_xml)
-    out_br = _count_br(out_xml)
-    br_cleared_text = in_br - br_in_old_punct - out_br
-
-    print(f"  Br 统计: 输入 {in_br} → 输出 {out_br}"
-          f"（旧句号清除 {br_in_old_punct}, 清空文字 CSR 清除 {br_cleared_text}）")
 
 
 def _verify_output(output_path: str, expected_chars: list[str]) -> None:
@@ -1449,28 +859,21 @@ def process(idml_path, result_path, output_path):
 
     # Step 2: 从句读结果提取
     print("\n[2/5] 读取句读结果...")
-    result_data = extract_from_result(result_path)
-    result_chars = result_data['chars']
+    result_chars = extract_from_result(result_path)
     punct_count = sum(1 for c in result_chars if c == '。')
     print(f"  提取 {len(result_chars)} 个字符（含 {punct_count} 个句号）")
-    if result_data['para_breaks']:
-        print(f"  检测到 {len(result_data['para_breaks'])} 个段落边界")
 
     # Step 3: 验证并对齐
     print("\n[3/5] 验证并对齐...")
-    alignment = validate_and_align(stories, result_data)
-    grouped_records = alignment['grouped']
-    split_sources = alignment['split_sources']
+    grouped_records = validate_and_align(stories, result_chars)
 
     # Step 4: 生成输出
     print("\n[4/5] 生成输出 IDML...")
-    generate_idml(idml_path, stories, grouped_records, split_sources, output_path)
+    generate_idml(idml_path, stories, grouped_records, output_path)
 
-    # Step 5: 多层验证 — 结构 → Br → 字符
+    # Step 5: 输出自检 — 从生成的 IDML 重新提取并与输入比对
+    # 这是防止写入过程引入数据丢失的最后一道防线
     print("\n[5/5] 验证输出 IDML...")
-    _verify_structure(idml_path, output_path, stories,
-                      split_sources, grouped_records)
-    _verify_br_count(idml_path, output_path)
     _verify_output(output_path, result_chars)
 
     print(f"\n{'=' * 60}")
