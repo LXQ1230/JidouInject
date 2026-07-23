@@ -767,8 +767,13 @@ def _rebuild_paragraph_xml(
             )
             if cdata['is_punct']:
                 # 旧句号 CSR 无新句号 → 清除
-                # trailing 区域的 punct CSR 保留 Br（如分隔符 CSR[29]）
-                if has_br and ci > max_text_idx:
+                # trailing 区域的 punct CSR：
+                #   - 原始内容为纯空白（如分隔符 CSR[29] 的两个空格）→ 保留 Br
+                #   - 原始内容为旧标点（如 '。'）→ 剥离 Br
+                orig_all_ws = all(
+                    not c.strip() for c in cdata.get('contents', [])
+                )
+                if has_br and ci > max_text_idx and orig_all_ws:
                     csr_replacements[ci] = _clear_content_keep_br(
                         orig_csr, strip_groups=is_split_copy
                     )
