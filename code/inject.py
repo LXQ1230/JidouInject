@@ -1042,12 +1042,10 @@ def _rebuild_paragraph_xml(
         has_punct_inside = any(p for p, _, _ in segments)
 
         if is_multi_content:
-            # 多 Content CSR：先按 after_slot 分配句号到正确的 Content 槽，
-            # 然后按原 Content 长度比例分配剩余文字
+            # 多 Content CSR：标点按 after_slot 分配到正确槽位
             orig_lens = [len(c) for c in orig_contents]
-            total_orig = sum(orig_lens)
 
-            # 将 segments 中的标点按 after_slot 分配到对应槽位
+            # 标点按 after_slot 归属到对应 Content 槽位
             punct_by_slot: dict[int, list[str]] = {}
             non_punct_text = ''
             for is_p, text, slot in segments:
@@ -1067,7 +1065,6 @@ def _rebuild_paragraph_xml(
                         share = max(1, len(non_punct_text) * ol // total_orig)
                     part_text = non_punct_text[pos:pos + share]
                     pos += share
-                    # 附加该槽位的标点
                     punct_text = ''.join(punct_by_slot.get(oi, []))
                     full_part = part_text + punct_text
                     old_ctag = f'<Content>{orig_contents[oi]}</Content>'
