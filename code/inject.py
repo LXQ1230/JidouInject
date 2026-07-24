@@ -31,10 +31,8 @@ _OLD_PUNCT_CHARS: set[str] = {
     '』',  # 』 RIGHT WHITE CORNER BRACKET
     '【',  # 【 LEFT BLACK LENTICULAR BRACKET
     '】',  # 】 RIGHT BLACK LENTICULAR BRACKET
-    '〔',  # 〔 LEFT TORTOISE SHELL BRACKET
-    '〕',  # 〕 RIGHT TORTOISE SHELL BRACKET
-    '〖',  # 〖 LEFT WHITE LENTICULAR BRACKET
-    '〗',  # 〗 RIGHT WHITE LENTICULAR BRACKET
+    # 〔 〕 不属于旧标点——在佛经中常用于校勘标注（如〔云〕表校订补充）
+    # 〖 〗 不属于旧标点——与 〔 〕 同为校勘标注标记
     '〜',  # 〜 WAVE DASH
     '〝',  # 〝 REVERSED DOUBLE PRIME QUOTATION MARK
     '〞',  # 〞 DOUBLE PRIME QUOTATION MARK
@@ -855,10 +853,11 @@ def _rebuild_paragraph_xml(
     # 4. 生成 CSR 级别的替换内容
     # csr_replacements: {csr_idx: replacement_xml_string}
     #
-    # 无记录 CSR 的 Br 保留规则（优先级 A1→A2→A3→A4）：
+    # 无记录 CSR 的 Br 保留规则（优先级 A1→A2→A3→A3.5→A4）：
     #   A1. punct + trailing + 纯空白内容 + 有 Br → 保留（分隔符）
     #   A2. text + close-trailing + 原为空 + 有 Br → 保留（尾饰）
     #   A3. text + 分割副本 → 剥离 Br + Group
+    #   A3.5. 中间 + 纯空白 + 有 Br → 保留（文字 CSR 之间的换行，如偈颂分行）
     #   A4. 其他 → 剥离 Br
     csr_replacements: dict[int, str] = {}
     for ci, cdata in enumerate(csr_list):
@@ -867,6 +866,7 @@ def _rebuild_paragraph_xml(
             orig_csr = cdata['match'].group(0)
             has_br = '<Br' in orig_csr
             is_trailing = ci > max_text_idx
+            is_leading = ci < min_text_idx
             is_close_trailing = (ci == first_trailing_decoration)
             is_punct = cdata['is_punct']
             orig_had_text = any(
@@ -894,8 +894,12 @@ def _rebuild_paragraph_xml(
                 csr_replacements[ci] = _clear_content_strip_br(
                     orig_csr, strip_groups=True
                 )
+            elif not is_leading and not is_trailing and has_br and orig_all_ws:
+                # A3.5: 中间区域（文字 CSR 之间）的空 + Br CSR → 保留
+                # 如偈颂前换行、段落内分行等排版需求
+                csr_replacements[ci] = _clear_content_keep_br(orig_csr)
             else:
-                # A4: leading / 中间 / 远 trailing → 剥离 Br
+                # A4: leading / 远 trailing / 其他 → 剥离 Br
                 csr_replacements[ci] = _clear_content_strip_br(orig_csr)
             continue
 

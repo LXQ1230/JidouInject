@@ -52,10 +52,10 @@ def find_pairs():
 
     all_files = os.listdir(PENDING_DIR)
 
-    # 按经号分组 IDML
+    # 按经号分组 IDML（排除注入输出文件 _WD注入.idml）
     idml_by_number: dict[str, list[str]] = {}
     for f in all_files:
-        if f.endswith(".idml"):
+        if f.endswith(".idml") and "_WD注入" not in f:
             num = _extract_number(f)
             if num is None:
                 print(f"警告: {f} 文件名无经号，跳过")
