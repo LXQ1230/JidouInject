@@ -28,11 +28,10 @@
    - 解决 `如來妙色身` 前换行被剥离问题（散文体→偈颂体的排版换行）
 5. **batch_inject.py 防御修复**：`find_pairs()` 排除 `_WD注入.idml` 文件
    - 防止上一轮注入输出被当作原始 IDML 再次配对
-6. **字体+U+3000 句号抑制**：思源宋体/仿宋/楷体后跟 U+3000 时，WD 结果中的 `。` 替换为 `　`
-   - 保留偈颂/目录分行分字排版原样
-   - `_extract_font_from_csr()` — 从 CSR XML 提取 AppliedFont
-   - `_should_suppress_punct()` — 对齐阶段判断是否抑制句号
-   - `_verify_output()` — 验证逻辑调整为忽略 unicode_whitespace（保留 U+3000）
+6. **字体+U+3000 句号抑制**：思源宋体/仿宋/楷体后跟 U+3000 时，WD 结果中的 `。` 丢弃，保留原 IDML 的 `　`
+   - `_SUPPRESS_PUNCT_FONTS` 使用 startswith 前缀匹配（如 `思源宋体` 匹配 `思源宋体 CN` 等所有变体）
+   - `_should_suppress_punct()` — 对齐阶段判断条件：同 CSR + 目标字体 + 中间有 U+3000
+   - `_verify_output()` — 验证逻辑改为用 alignment 输出序列比对（配合抑制后校验）
 
 ### 批量处理配对规则（最新版）
 
