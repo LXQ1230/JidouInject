@@ -1044,6 +1044,7 @@ def _rebuild_paragraph_xml(
         if is_multi_content:
             # 多 Content CSR：标点按 after_slot 分配到正确槽位
             orig_lens = [len(c) for c in orig_contents]
+            total_orig = sum(orig_lens)
 
             # 标点按 after_slot 归属到对应 Content 槽位
             punct_by_slot: dict[int, list[str]] = {}
