@@ -933,7 +933,7 @@ def _rebuild_paragraph_xml(
     # 3.5 确定文字内容 CSR 的范围（用于区分 leading/trailing 清除区域）
     text_content_csrs = {
         ci for ci, segs in csr_segments.items()
-        if any(not is_p for is_p, _ in segs) and not csr_list[ci]['is_punct']
+        if any(not is_p for is_p, _, _ in segs) and not csr_list[ci]['is_punct']
     }
     min_text_idx = min(text_content_csrs) if text_content_csrs else 0
     max_text_idx = max(text_content_csrs) if text_content_csrs else len(csr_list) - 1
@@ -1012,7 +1012,7 @@ def _rebuild_paragraph_xml(
             # 旧句号 CSR：保留原 CSR 中的 Br，Content 用模板替换
             orig_csr = cdata['match'].group(0)
             has_br = '<Br' in orig_csr
-            punct_segments = [t for is_p, t in segments if is_p]
+            punct_segments = [t for is_p, t, _ in segments if is_p]
             if not punct_segments:
                 # 无新句号 → 清空 Content
                 csr_replacements[ci] = (
@@ -1039,7 +1039,7 @@ def _rebuild_paragraph_xml(
 
         orig_contents = cdata.get('contents', [])
         is_multi_content = len(orig_contents) > 1
-        has_punct_inside = any(p for p, _ in segments)
+        has_punct_inside = any(p for p, _, _ in segments)
 
         if is_multi_content:
             # 多 Content CSR：先按 after_slot 分配句号到正确的 Content 槽，
@@ -1082,7 +1082,7 @@ def _rebuild_paragraph_xml(
 
         if not has_punct_inside:
             # 单 Content、无拆分：全部文字合并
-            text = ''.join(t for _, t in segments)
+            text = ''.join(t for _, t, _ in segments)
             csr_replacements[ci] = (
                 csr_prefix
                 + f'<Content>{_xml_escape(text)}</Content>'
@@ -1099,9 +1099,9 @@ def _rebuild_paragraph_xml(
                 r'<Group[^>]*>.*?</Group>', '', clean_prefix, flags=re.DOTALL
             )
             clean_suffix = csr_xml[csr_xml.rfind('</CharacterStyleRange>'):]
-            non_punct_parts = [i for i, (is_p, _) in enumerate(segments) if not is_p]
+            non_punct_parts = [i for i, (is_p, _, _) in enumerate(segments) if not is_p]
             parts = []
-            for i, (is_p, text) in enumerate(segments):
+            for i, (is_p, text, _slot) in enumerate(segments):
                 if is_p and punct_template:
                     parts.append(punct_template)
                 else:
