@@ -33,6 +33,12 @@
    - `_should_suppress_punct()` — 对齐阶段判断条件：同 CSR + 目标字体 + 中间有 U+3000
    - `_verify_output()` — 验证逻辑改为用 alignment 输出序列比对（配合抑制后校验）
 
+7. **多 Content CSR 标点按 after_slot 分配**：解决标题标点错配问题
+   - `csr_segments` 改为三元组 `(is_punct, text, after_slot)`
+   - 标点按 `after_slot` 归属到正确的 Content 槽位
+   - 修复：`一心三觀`、`約心觀佛`、`觀麤見妙` 等标题的 `。` 错误出现在下一行
+   - ⚠️ 已知问题：`461` 仍有问题（`佛說七䖏三觀經。` → 输出 `七䖏三。觀經`），根因：分割段落中多 Content CSR 的文字比例分配逻辑与槽位不一致
+
 ### 批量处理配对规则（最新版）
 
 | 维度 | 规则 |
