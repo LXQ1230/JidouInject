@@ -97,6 +97,93 @@ def _is_old_punct(ch: str) -> bool:
     return ch in _OLD_PUNCT_CHARS
 
 
+# 目标字体集合 — 这些字体的字符后跟 U+3000 时，抑制 。 插入
+_SUPPRESS_PUNCT_FONTS: set[str] = {
+    '思源宋体 CN',
+    '仿宋 (OTF)',
+    '楷体',
+}
+
+
+def _extract_font_from_csr(csr_attrs: str, csr_inner: str) -> str | None:
+    """从 CSR 的 XML 片段中提取 AppliedFont 名称。
+
+    字体名存储在 <Properties><AppliedFont type="string">xxx</AppliedFont></Properties> 中。
+    """
+    font_match = re.search(
+        r'<AppliedFont\s+type="string">([^<]+)</AppliedFont>',
+        csr_inner,
+    )
+    return font_match.group(1) if font_match else None
+
+
+def _is_suppress_target(font: str | None) -> bool:
+    """判断字体是否属于需要抑制 。 的目标字体。"""
+    if font is None:
+        return False
+    return font in _SUPPRESS_PUNCT_FONTS
+
+
+def _should_suppress_punct(
+    idml_idx: int,
+    idml_clean_indices: list[int],
+    all_idml_records: list[dict],
+    last_slot: tuple | None,
+) -> bool:
+    """判断 WD 结果中的 。 是否应被抑制（替换为 U+3000）。
+
+    条件：下一个 IDML 文字字符匹配以下规则：
+    1. 与上一个文字字符在同一 CSR 内（csr_idx 相同）
+    2. 该 CSR 的字体是目标字体之一（思源宋体/仿宋/楷体）
+    3. 上一个字符与下一个字符之间在 IDML 中有一位 U+3000 间隔
+
+    这保留了偈颂/目录中 U+3000 空格间隔的原样排版。
+    """
+    if last_slot is None:
+        return False
+    if idml_idx >= len(idml_clean_indices):
+        return False
+
+    # 找下一个 IDML 文字字符
+    next_idx = None
+    for j in range(idml_idx, len(idml_clean_indices)):
+        ti = idml_clean_indices[j]
+        rec = all_idml_records[ti]
+        if not _is_ws_for_compare(rec['char']):
+            next_idx = j
+            break
+
+    if next_idx is None:
+        return False
+
+    next_ti = idml_clean_indices[next_idx]
+    next_rec = all_idml_records[next_ti]
+    prev_si, prev_pi, prev_ci, prev_sl = last_slot
+
+    # 同 CSR？
+    if next_rec['csr_idx'] != prev_ci:
+        return False
+
+    # 同 story/para？
+    if next_rec['story_idx'] != prev_si:
+        return False
+    if next_rec['para_idx'] != prev_pi:
+        return False
+
+    # 字体是目标？
+    if not _is_suppress_target(next_rec.get('font')):
+        return False
+
+    # 两者之间有没有 U+3000？（查看两者在 idml_clean_indices 区间内的记录）
+    for j in range(idml_idx, next_idx):
+        ti = idml_clean_indices[j]
+        rec = all_idml_records[ti]
+        if rec['char'] == '　':
+            return True
+
+    return False
+
+
 def _is_unicode_whitespace(ch: str) -> bool:
     """判断字符是否为 Unicode 空白/控制字符（IDML 中的布局空白）。
 
@@ -454,6 +541,9 @@ def _parse_paragraph_style_range(
             csr_idx += 1
             continue
 
+        # 提取此 CSR 的字体（用于抑制目标字体中 U+3000 前的 。）
+        font = _extract_font_from_csr(match.group(1), inner)
+
         # 每个 <Content> → 一组字符，打上槽位标签
         for slot_idx, cm in enumerate(content_matches):
             content_text = cm.group(1)
@@ -468,6 +558,7 @@ def _parse_paragraph_style_range(
                     'para_idx': para_idx,
                     'csr_idx': csr_idx,
                     'content_slot': slot_idx,
+                    'font': font,
                 })
                 continue
 
@@ -480,6 +571,7 @@ def _parse_paragraph_style_range(
                     'para_idx': para_idx,
                     'csr_idx': csr_idx,
                     'content_slot': slot_idx,
+                    'font': font,
                 })
 
         csr_idx += 1
@@ -679,18 +771,24 @@ def validate_and_align(stories: list[dict], result_data: dict) -> dict:
                 next_new_idx[si] = new_idx + 1
 
         if ch == '。':
-            si, pi, ci, sl = last_slot if last_slot else (0, 0, 0, 0)
-            effective_pi = current_effective.get((si, pi), pi)
-            new_records.append({
-                'char': '。',
-                'is_punct': True,
-                'is_special': False,
-                'story_idx': si,
-                'para_idx': effective_pi,
-                'csr_idx': -1,
-                'content_slot': -1,
-                'after_csr': ci,
-            })
+            # 检查是否应抑制 。：IDML 原文此处为 U+3000 分字间隔
+            # 条件：下一个 IDML 文字字符与上一个在同一 CSR 内，且字体为目标字体
+            if _should_suppress_punct(idml_idx, idml_clean_indices,
+                                       all_idml_records, last_slot):
+                pass  # 目标字体 U+3000 间隔 → 丢弃 。
+            else:
+                si, pi, ci, sl = last_slot if last_slot else (0, 0, 0, 0)
+                effective_pi = current_effective.get((si, pi), pi)
+                new_records.append({
+                    'char': '。',
+                    'is_punct': True,
+                    'is_special': False,
+                    'story_idx': si,
+                    'para_idx': effective_pi,
+                    'csr_idx': -1,
+                    'content_slot': -1,
+                    'after_csr': ci,
+                })
         elif _is_ws_for_compare(ch):
             pass
         else:
@@ -1507,19 +1605,22 @@ def _verify_output(output_path: str, expected_chars: list[str]) -> None:
             for rec in para['chars']:
                 all_records.append(rec)
 
-    # 构建输出字符序列（排除比对空白，因为对齐时已丢弃结果中的空白，
-    # 只保留 IDML 的空白，所以输出在空白上必然与输入不同）
+    # 构建输出字符序列：
+    # - 跳过 Unicode 空白（_is_unicode_whitespace）
+    # - 保留 U+3000（它在 _is_unicode_whitespace 中返回 False）
+    # - 保留所有可见字符和句号
     output_chars: list[str] = []
     for rec in all_records:
         ch = rec['char']
         if _is_unicode_whitespace(ch):
             continue
-        if _is_ws_for_compare(ch):
-            continue
         output_chars.append(ch)
 
-    # 比对（排除空白后，文字和句号序列必须一致）
-    expected_filtered = [c for c in expected_chars if not _is_ws_for_compare(c)]
+    # expected_chars 也按同规则处理（跳过 unicode_whitespace）
+    expected_filtered = [
+        c for c in expected_chars
+        if not _is_unicode_whitespace(c)
+    ]
     expected_str = ''.join(expected_filtered)
     output_str = ''.join(output_chars)
 
