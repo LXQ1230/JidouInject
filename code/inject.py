@@ -777,9 +777,7 @@ def validate_and_align(stories: list[dict], result_data: dict) -> dict:
             if _should_suppress_punct(idml_idx, idml_clean_indices,
                                        all_idml_records, last_slot):
                 # 目标字体 U+3000 间隔 → 不插入 。
-                # 对齐循环后续会自然消费 IDML 中的 U+3000 记录，
-                # 因为 U+3000 不在 _is_ws_for_compare 过滤范围内，
-                # 所以它作为普通字符被 all_idml_records 保留并写入输出。
+                # IDML 原文的 U+3000 作为 IDML 记录保留在输出中，对齐循环继续
                 pass
             else:
                 si, pi, ci, sl = last_slot if last_slot else (0, 0, 0, 0)
@@ -793,6 +791,7 @@ def validate_and_align(stories: list[dict], result_data: dict) -> dict:
                     'csr_idx': -1,
                     'content_slot': -1,
                     'after_csr': ci,
+                    'after_slot': sl,
                 })
         elif _is_ws_for_compare(ch):
             pass
@@ -916,8 +915,10 @@ def _rebuild_paragraph_xml(
         punct_template = global_punct_template
 
     # 3. 将记录按 csr_idx 分组（含句号：after_csr 指向它跟随的文字 CSR）
-    # csr_texts: {csr_idx: [(is_punct, text), ...]} — 保持原始顺序
-    csr_segments: dict[int, list[tuple[bool, str]]] = {}
+    # csr_segments: {csr_idx: [(is_punct, text, after_slot|null), ...]}
+    # 对于文字: csr_idx = rec['csr_idx']
+    # 对于句号: csr_idx = rec['after_csr'], after_slot = rec.get('after_slot')
+    csr_segments: dict[int, list[tuple[bool, str, int | None]]] = {}
     for rec in all_records:
         if rec.get('is_punct', False):
             ci = rec.get('after_csr', -1)
@@ -926,7 +927,8 @@ def _rebuild_paragraph_xml(
         if ci < 0:
             continue
         is_p = rec.get('is_punct', False)
-        csr_segments.setdefault(ci, []).append((is_p, rec['char']))
+        slot = rec.get('after_slot') if is_p else None
+        csr_segments.setdefault(ci, []).append((is_p, rec['char'], slot))
 
     # 3.5 确定文字内容 CSR 的范围（用于区分 leading/trailing 清除区域）
     text_content_csrs = {
@@ -1040,25 +1042,37 @@ def _rebuild_paragraph_xml(
         has_punct_inside = any(p for p, _ in segments)
 
         if is_multi_content:
-            # 多 Content CSR：按原 Content 数量比例分配文字（含句号）
+            # 多 Content CSR：先按 after_slot 分配句号到正确的 Content 槽，
+            # 然后按原 Content 长度比例分配剩余文字
             orig_lens = [len(c) for c in orig_contents]
             total_orig = sum(orig_lens)
-            new_text = ''.join(t for _, t in segments)
+
+            # 将 segments 中的标点按 after_slot 分配到对应槽位
+            punct_by_slot: dict[int, list[str]] = {}
+            non_punct_text = ''
+            for is_p, text, slot in segments:
+                if is_p:
+                    sl = slot if slot is not None else 0
+                    punct_by_slot.setdefault(sl, []).append(text)
+                else:
+                    non_punct_text += text
+
             if total_orig > 0:
                 parts_xml = csr_xml
                 pos = 0
                 for oi, ol in enumerate(orig_lens):
                     if oi == len(orig_contents) - 1:
-                        share = len(new_text) - pos
+                        share = len(non_punct_text) - pos
                     else:
-                        share = max(1, len(new_text) * ol // total_orig)
-                    part_text = new_text[pos:pos + share]
+                        share = max(1, len(non_punct_text) * ol // total_orig)
+                    part_text = non_punct_text[pos:pos + share]
                     pos += share
+                    # 附加该槽位的标点
+                    punct_text = ''.join(punct_by_slot.get(oi, []))
+                    full_part = part_text + punct_text
                     old_ctag = f'<Content>{orig_contents[oi]}</Content>'
-                    new_ctag = f'<Content>{_xml_escape(part_text)}</Content>'
+                    new_ctag = f'<Content>{_xml_escape(full_part)}</Content>'
                     parts_xml = parts_xml.replace(old_ctag, new_ctag, 1)
-                # 分割副本：剥离多 Content 间的 Br
-                # （原单段落的节标题格式在分割后不再适用）
                 if is_split_copy:
                     parts_xml = re.sub(r'<Br\s*/>', '', parts_xml)
                 csr_replacements[ci] = parts_xml
