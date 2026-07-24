@@ -98,11 +98,12 @@ def _is_old_punct(ch: str) -> bool:
 
 
 # 目标字体集合 — 这些字体的字符后跟 U+3000 时，抑制 。 插入
-_SUPPRESS_PUNCT_FONTS: set[str] = {
-    '思源宋体 CN',
-    '仿宋 (OTF)',
+# 使用 startswith 前缀匹配：如 '思源宋体' 匹配 '思源宋体 CN'、'思源宋体 TW' 等所有变体
+_SUPPRESS_PUNCT_FONTS: list[str] = [
+    '思源宋体',
+    '仿宋',
     '楷体',
-}
+]
 
 
 def _extract_font_from_csr(csr_attrs: str, csr_inner: str) -> str | None:
@@ -118,10 +119,10 @@ def _extract_font_from_csr(csr_attrs: str, csr_inner: str) -> str | None:
 
 
 def _is_suppress_target(font: str | None) -> bool:
-    """判断字体是否属于需要抑制 。 的目标字体。"""
+    """判断字体是否属于需要抑制 。 的目标字体（前缀匹配）。"""
     if font is None:
         return False
-    return font in _SUPPRESS_PUNCT_FONTS
+    return any(font.startswith(prefix) for prefix in _SUPPRESS_PUNCT_FONTS)
 
 
 def _should_suppress_punct(
@@ -775,7 +776,11 @@ def validate_and_align(stories: list[dict], result_data: dict) -> dict:
             # 条件：下一个 IDML 文字字符与上一个在同一 CSR 内，且字体为目标字体
             if _should_suppress_punct(idml_idx, idml_clean_indices,
                                        all_idml_records, last_slot):
-                pass  # 目标字体 U+3000 间隔 → 丢弃 。
+                # 目标字体 U+3000 间隔 → 不插入 。
+                # 对齐循环后续会自然消费 IDML 中的 U+3000 记录，
+                # 因为 U+3000 不在 _is_ws_for_compare 过滤范围内，
+                # 所以它作为普通字符被 all_idml_records 保留并写入输出。
+                pass
             else:
                 si, pi, ci, sl = last_slot if last_slot else (0, 0, 0, 0)
                 effective_pi = current_effective.get((si, pi), pi)
@@ -1694,7 +1699,15 @@ def process(idml_path, result_path, output_path):
     _verify_structure(idml_path, output_path, stories,
                       split_sources, grouped_records)
     _verify_br_count(idml_path, output_path)
-    _verify_output(output_path, result_chars)
+    # 构建验证用的 expected：从 alignment new_records 提取
+    # （用 new_records 而非 result_chars，因为 。 抑制已将 。 替换为 U+3000）
+    verify_expected: list[str] = []
+    for recs in alignment['grouped'].values():
+        for recs2 in recs.values():
+            for r in recs2:
+                if not _is_unicode_whitespace(r['char']):
+                    verify_expected.append(r['char'])
+    _verify_output(output_path, verify_expected)
 
     print(f"\n{'=' * 60}")
     print(f"完成！输出文件: {output_path}")
