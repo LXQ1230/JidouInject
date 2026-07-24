@@ -1,24 +1,67 @@
 # Progress Log: 佛经句读回注 IDML 工具
 
-## 当前状态（2026-07-23 最终版）
+## 当前状态（2026-07-24）
+
+### 仓库信息
+
+| 项目 | 详情 |
+|------|------|
+| GitHub | https://github.com/LXQ1230/JidouInject |
+| 默认分支 | `main` |
+| 当前分支 | `dev` |
+| 未推送 | 是（本次会话暂不同步到 GitHub） |
+
+### 本次会话变更（2026-07-24 下午）
+
+1. **恢复 IDML/indd 文件**：30 个文件从 `b8172b8` 恢复到原位置（source/、injected/、done/、backup/）
+2. **批量配对规则重写**：从"前缀匹配"改为"按经号匹配"
+   - `_extract_number()` — 用正则 `^(\d+)` 提取文件名开头经号
+   - `find_pairs()` — 按经号分组 IDML/MD/TXT，同号配对
+   - 放宽 IDML 识别：`*导出.idml` → `*.idml`
+   - 放宽 MD 识别：不再要求前缀一致
+   - 新增 TXT 支持：`*句读结果.txt` 与 `*句读结果.md` 同等对待
+   - `archive()` 源文件匹配：`f.startswith()` → `_extract_number() == name`（防 175 误匹配 1750）
+
+### 批量处理配对规则（最新版）
+
+| 维度 | 规则 |
+|------|------|
+| IDML 文件 | `*.idml`（文件名以经号开头） |
+| 句读结果 | `*句读结果.md` 或 `*句读结果.txt`（文件名以经号开头） |
+| 配对方式 | 按经号（文件名开头数字）匹配，相同经号即为一对 |
+| 多文件冲突 | 同经号多个文件 → 用第一个，打印警告 |
+| 缺配对 | 打印警告后跳过 |
+
+### 单文件 vs 批量格式支持
+
+| 格式 | 单文件 `inject.py` | 批量 `batch_inject.py` |
+|------|:--:|:--:|
+| MD | ✅ | ✅ |
+| TXT | ✅ | ✅（刚添加） |
+| 开发分支 | `dev` |
+| SSH | ED25519，走 443 端口 |
 
 ### 目录结构
 
 ```
-佛经句读回注IDML工具/
+JidouInject/
 ├── 一键批量处理.bat              ← 根目录快捷启动
-├── CLAUDE.md
-├── progress.md
+├── CLAUDE.md                     ← 项目说明 + 句读规则
+├── README.md
+├── progress.md                   ← 本文件
+├── issues-checklist.md           ← 剩余问题清单（17 项）
+├── findings.md                   ← 技术发现与决策
+├── task_plan.md                  ← 实现计划
 │
-├── code/                         # 脚本
-│   ├── inject.py                 # 单文件注入
-│   ├── inject.bat                # 单文件拖拽
-│   ├── batch_inject.py           # 批量处理
+├── code/                         # 核心脚本
+│   ├── inject.py                 # 单文件注入（1600 行，30 函数）
+│   ├── inject.bat                # 单文件拖拽包装器
+│   ├── batch_inject.py           # 批量处理（212 行）
 │   ├── batch_inject.bat          # 批量一键启动
-│   └── test_verify_inject.py     # 回归测试
+│   └── test_verify_inject.py     # 回归测试（299 行）
 │
 ├── source/                       # 原始文件（只读，不处理）
-│   ├── 275/461/175 的 IDML + MD 源文件
+│   ├── 175/275/461 的 IDML + MD 源文件
 │   ├── 定稿未改动/               # 原始 InDesign 文件
 │   └── 导出IDML/                 # 导出的 IDML
 │
@@ -26,22 +69,24 @@
 ├── output/                       # 本轮处理结果
 ├── injected/                     # 所有注入结果汇总（永久保留）
 ├── done/                         # 已完成归档（按经本分目录）
-│   ├── 275/
-│   ├── 461/
-│   └── 175/
 │
-└── backup/                       # 代码版本备份
-    ├── v1.0-2026.07.22/
-    └── v1.1-2026.07.23/
+├── backup/                       # 代码版本备份
+│   ├── v1.0-2026.07.22/
+│   └── v1.1-2026.07.23/
+│
+└── .gitignore                    # 排除: *.idml, *.indd, __pycache__,
+                                  #   output/, pending/, injected/, done/, backup/
 ```
 
 ### 使用方式
 
 | 场景 | 操作 |
 |------|------|
-| 单文件 | 拖拽 IDML+MD 到 `code/inject.bat`，或 `python code/inject.py --idml ... --result ...` |
+| 单文件 | 拖拽 IDML+MD 到 `code/inject.bat`，或 `python -X utf8 code/inject.py --idml ... --result ...` |
 | 批量处理 | 文件放入 `pending/`，双击 `一键批量处理.bat` |
-| 回归测试 | `python code/test_verify_inject.py` |
+| 回归测试 | `python -X utf8 code/test_verify_inject.py` |
+
+> **Windows 注意**: 需加 `-X utf8` 标志或设置 `PYTHONIOENCODING=utf-8`，否则 Unicode 符号会触发 GBK 编码错误。
 
 ### 功能完整性
 
@@ -78,16 +123,18 @@ close-trailing 判定：预扫描找到第一个"空+有Br"的 text CSR。
 | 多 Content + 分割副本 | **剥离 Content 间 Br** |
 | punct（有新句号） | 追加原 CSR 的 Br |
 
-### 测试结果
+### 测试结果（2026-07-24）
 
 | 测试 | 275 | 461 |
 |------|-----|-----|
-| 原文文字零改动 | ✅ 5684 | ✅ 9208 |
+| 原文文字零改动 | ✅ 5684 字 | ✅ 9208 字 |
 | Group ID 唯一 | ✅ 11 | ✅ 1 |
-| 分割段落 leading Br | ✅ 0 | ✅ 0 |
+| 分割段落 leading Br | ✅ 0 | ✅ 0（42 段落） |
 | 关键段落空行 | ✅ 3/3 | — |
-| 输出自检 | ✅ 6748 | ✅ 10725 |
+| 输出自检 | ✅ 6748 字符 | ✅ 10725 字符 |
 | Br 统计 | 41→39 | 45→43 |
+
+> 2026-07-24 验证：两个测试用例全部通过，完整注入流程（解析→读取→对齐→生成→验证）正常运行。
 
 ### 已知局限
 
@@ -116,6 +163,12 @@ close-trailing 判定：预扫描找到第一个"空+有Br"的 text CSR。
 
 ### 历史会话
 
+- **2026-07-24**：第二轮项目检查 + 项目清理 + GitHub 推送
+  - 项目检查：5/12 旧问题已解决，发现 10 项新问题
+  - 立即清理：删除临时文件、完善 `.gitignore`、移除 30 个二进制文件追踪（439 files, -105072 行）
+  - 分支管理：`master` → `main`，设 `main` 为默认分支
+  - GitHub：配置 SSH（ED25519, 443 端口），推送 `dev` + `main`
+  - 剩余问题清单保存至 `issues-checklist.md`（17 项）
 - **2026-07-23**：段落分割 + Br/Group 规则（A1-A4/B）+ 目录重组 + 批量处理 + 冲突检测
 - **2026-07-22**：代码审查修复 + 全面测试 + 健壮性增强
 - **2026-07-21**：项目初始化 + 5 核心函数 + 流水线建立

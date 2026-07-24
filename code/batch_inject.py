@@ -2,7 +2,7 @@
 """
 批量 IDML 句读回注工具
 
-扫描 pending/ 目录，自动配对 IDML 和句读结果文件，
+扫描 pending/ 目录，按经号（文件名开头数字）自动配对 IDML 和句读结果文件（.md / .txt），
 逐个处理，结果输出到 output/，完成后归档到 done/ + injected/。
 
 用法:
@@ -27,30 +27,72 @@ INJECTED_DIR = os.path.join(PROJECT_ROOT, "injected")
 DONE_DIR = os.path.join(PROJECT_ROOT, "done")
 
 
+def _extract_number(filename: str) -> str | None:
+    """从文件名中提取开头的经号（数字）。
+
+    Returns:
+        经号字符串，如 '175'；无数字开头则返回 None
+    """
+    m = re.match(r'^(\d+)', filename)
+    return m.group(1) if m else None
+
+
 def find_pairs():
-    """扫描 pending/ 目录，返回 (idml_path, result_path, name) 配对列表"""
+    """扫描 pending/ 目录，按经号配对 IDML 和句读结果文件。
+
+    规则：
+    - IDML：*.idml 即可
+    - MD：  *句读结果.md 即可
+    - TXT： *句读结果.txt 即可
+    - 配对：提取文件名开头的数字（经号），相同经号即配为一对
+    """
     if not os.path.isdir(PENDING_DIR):
         print(f"错误: pending/ 目录不存在: {PENDING_DIR}")
         sys.exit(1)
 
-    idml_files = [f for f in os.listdir(PENDING_DIR) if f.endswith("导出.idml")]
-    pairs = []
+    all_files = os.listdir(PENDING_DIR)
 
-    for idml_file in sorted(idml_files):
-        prefix = idml_file.replace("导出.idml", "")
-        md_candidates = [
-            f for f in os.listdir(PENDING_DIR)
-            if f.startswith(prefix) and f.endswith("句读结果.md")
-        ]
-        if not md_candidates:
-            print(f"警告: {idml_file} 找不到对应句读结果，跳过")
+    # 按经号分组 IDML
+    idml_by_number: dict[str, list[str]] = {}
+    for f in all_files:
+        if f.endswith(".idml"):
+            num = _extract_number(f)
+            if num is None:
+                print(f"警告: {f} 文件名无经号，跳过")
+                continue
+            idml_by_number.setdefault(num, []).append(f)
+
+    # 按经号分组 MD/TXT
+    md_by_number: dict[str, list[str]] = {}
+    for f in all_files:
+        if f.endswith("句读结果.md") or f.endswith("句读结果.txt"):
+            num = _extract_number(f)
+            if num is None:
+                print(f"警告: {f} 文件名无经号，跳过")
+                continue
+            md_by_number.setdefault(num, []).append(f)
+
+    # 配对
+    pairs = []
+    for num in sorted(idml_by_number):
+        idml_list = idml_by_number[num]
+        md_list = md_by_number.get(num, [])
+
+        if len(idml_list) > 1:
+            print(f"警告: 经号 {num} 有多个 IDML 文件 ({idml_list})，使用第一个: {idml_list[0]}")
+        if len(md_list) > 1:
+            print(f"警告: 经号 {num} 有多个句读结果 ({md_list})，使用第一个: {md_list[0]}")
+
+        if not md_list:
+            print(f"警告: 经号 {num} ({idml_list[0]}) 找不到对应句读结果，跳过")
             continue
-        md_file = md_candidates[0]
+
         pairs.append((
-            os.path.join(PENDING_DIR, idml_file),
-            os.path.join(PENDING_DIR, md_file),
-            prefix,
+            os.path.join(PENDING_DIR, idml_list[0]),
+            os.path.join(PENDING_DIR, md_list[0]),
+            num,
         ))
+
     return pairs
 
 
@@ -115,7 +157,7 @@ def archive(name, decisions):
 
     # pending 源文件 → done
     for f in os.listdir(PENDING_DIR):
-        if f.startswith(name):
+        if _extract_number(f) == name:
             src = os.path.join(PENDING_DIR, f)
             dst = os.path.join(done_dir, f)
             _smart_move(src, dst, decisions.get(dst, 'overwrite'))
@@ -146,7 +188,7 @@ def main():
 
     if not pairs:
         print("pending/ 中没有找到可处理的文件对。")
-        print("请将 *导出.idml 和 *句读结果.md 放入 pending/ 目录。")
+        print("请将 *.idml 和 *句读结果.md/.txt 放入 pending/ 目录（文件名以经号开头）。")
         return
 
     print(f"找到 {len(pairs)} 个待处理文件对:\n")
