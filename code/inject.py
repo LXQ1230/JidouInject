@@ -927,7 +927,10 @@ def _rebuild_paragraph_xml(
         if ci < 0:
             continue
         is_p = rec.get('is_punct', False)
-        slot = rec.get('after_slot') if is_p else None
+        if is_p:
+            slot = rec.get('after_slot')
+        else:
+            slot = rec.get('content_slot')
         csr_segments.setdefault(ci, []).append((is_p, rec['char'], slot))
 
     # 3.5 确定文字内容 CSR 的范围（用于区分 leading/trailing 清除区域）
@@ -1013,12 +1016,19 @@ def _rebuild_paragraph_xml(
             orig_csr = cdata['match'].group(0)
             has_br = '<Br' in orig_csr
             punct_segments = [t for is_p, t, _ in segments if is_p]
-            if not punct_segments:
+            text_segments = [(is_p, t, slot) for is_p, t, slot in segments if not is_p]
+            if text_segments:
+                # CSR 带有句号样式但包含非标点内容（如 U+3000 全角空格
+                # 因排版需要被赋予了 CharacterStyle/句号样式）。
+                # 不作为 punct CSR 处理，fall through 到文字 CSR 逻辑。
+                pass
+            elif not punct_segments:
                 # 无新句号 → 清空 Content
                 csr_replacements[ci] = (
                     _clear_content_keep_br(orig_csr, strip_groups=is_split_copy)
                     if has_br else ''
                 )
+                continue
             elif punct_template:
                 fill = ''.join(punct_template for _ in punct_segments)
                 if has_br:
@@ -1027,6 +1037,7 @@ def _rebuild_paragraph_xml(
                     if br_match and '<Br' not in fill:
                         fill += br_match.group(0)
                 csr_replacements[ci] = fill
+                continue
             continue
 
         # 文字 CSR：检查是否需要拆分
@@ -1042,30 +1053,25 @@ def _rebuild_paragraph_xml(
         has_punct_inside = any(p for p, _, _ in segments)
 
         if is_multi_content:
-            # 多 Content CSR：标点按 after_slot 分配到正确槽位
+            # 多 Content CSR：文字按实际 content_slot 分组，标点按 after_slot 分配
             orig_lens = [len(c) for c in orig_contents]
             total_orig = sum(orig_lens)
 
-            # 标点按 after_slot 归属到对应 Content 槽位
+            # 文字按实际 slot 分组，标点按 after_slot 归属到对应 Content 槽位
+            text_by_slot: dict[int, str] = {}
             punct_by_slot: dict[int, list[str]] = {}
-            non_punct_text = ''
             for is_p, text, slot in segments:
                 if is_p:
                     sl = slot if slot is not None else 0
                     punct_by_slot.setdefault(sl, []).append(text)
                 else:
-                    non_punct_text += text
+                    sl = slot if slot is not None else 0
+                    text_by_slot[sl] = text_by_slot.get(sl, '') + text
 
             if total_orig > 0:
                 parts_xml = csr_xml
-                pos = 0
                 for oi, ol in enumerate(orig_lens):
-                    if oi == len(orig_contents) - 1:
-                        share = len(non_punct_text) - pos
-                    else:
-                        share = max(1, len(non_punct_text) * ol // total_orig)
-                    part_text = non_punct_text[pos:pos + share]
-                    pos += share
+                    part_text = text_by_slot.get(oi, '')
                     punct_text = ''.join(punct_by_slot.get(oi, []))
                     full_part = part_text + punct_text
                     old_ctag = f'<Content>{orig_contents[oi]}</Content>'
