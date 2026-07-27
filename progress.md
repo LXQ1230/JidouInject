@@ -14,21 +14,23 @@
 
 ### 本次会话变更（2026-07-27）
 
-**1. 修复：U+3000 全角空格在注入过程中丢失** — `436209a`
-- **根因**：IDML 中 U+3000 的 CSR 被赋予了 `CharacterStyle/句号` 样式，`_rebuild_paragraph_xml` 按样式名将其错误分类为 punct CSR。alignment 中 U+3000 记录 `is_punct=False` → `punct_segments` 为空 → 清空逻辑删除整个 CSR（175 文件 239 个丢失）。
-- **修复**：在 punct CSR 处理逻辑中新增 `text_segments` 检测 —— 当带有句号样式的 CSR 包含非标点内容时，fall through 到文字 CSR 逻辑，保留原内容。
+**1. 修复：BOM 头自动处理** — `bdb7233`
+- **根因**：部分句读结果文件带有 UTF-8 BOM（U+FEFF），导致首字符不匹配。461 句读结果文件 BOM 导致字数 9210 vs 9208。
+- **修复**：`extract_from_result()` 改用 `encoding='utf-8-sig'` 打开文件，自动跳过 BOM。
 
-**2. 新增：IDML 工具库独立模块 `code/idml_utils.py`** — `9597ef1`
-- 1582 行，28 个函数，按功能分 9 个区，可在其他项目中 `from idml_utils import ...` 复用。
+**2. 修复：句号 CSR 强制使用思源宋体** — `a9e78be`
+- 句号继承前邻文字的 PointSize 但强制覆盖 AppliedFont 为思源宋体，解决字体缺少句号 glyph 无法显示的问题。
 
-**3. 修复：句号 CSR 继承前邻文字前缀（PointSize 等）** — `9597ef1`
-- **根因**：句号使用全局 punct template，在双排小字场景中字号与上下文不一致。
-- **修复**：拆分 CSR 时，句号继承前邻文字 segment 的 CSR 前缀，仅从 punct_template 取 Content。
+**3. 新增：IDML 工具库独立模块** — `9597ef1`
+- `code/idml_utils.py`（28 个函数，9 个功能区），可在其他项目中复用。
 
-**4. 修复：句号 CSR 强制使用思源宋体** — `a9e78be`
-- **根因**：经书粗宋/仿宋/楷体等字体缺少句号 glyph，回注后无法显示。
-- **修复**：句号继承前邻文字的 PointSize 等属性，但强制覆盖 AppliedFont 为思源宋体。
-- **验证**：3093 输出 929 个句号全部使用思源宋体，275/175 回归全部通过。
+**4. 修复：句号继承前邻文字前缀** — `9597ef1`
+- 句号从全局模板改为继承前邻文字 CSR 的 PointSize，解决双排小字字号不一致。
+
+**5. 修复：U+3000 全角空格丢失** — `436209a`
+- punt CSR 按样式名分类时误将含 U+3000 的 CSR 清空。
+
+### 已知问题
 
 ### 历史会话（续）
 

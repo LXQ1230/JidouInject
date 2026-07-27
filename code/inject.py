@@ -618,7 +618,7 @@ def extract_from_result(md_path: str) -> dict:
                         （边界在位置 i 表示 chars[i] 是新段落的第一个字符）
     }
     """
-    with open(md_path, 'r', encoding='utf-8') as f:
+    with open(md_path, 'r', encoding='utf-8-sig') as f:
         content = f.read()
 
     # 跳过文件头（# 标题 到 第一个 --- 之间的内容）
