@@ -9,15 +9,25 @@
 | GitHub | https://github.com/LXQ1230/JidouInject |
 | 默认分支 | `main` |
 | 当前分支 | `dev` |
-| 未推送 | 是 |
+| 状态 | ✅ 已推送 |
 
 ### 本次会话变更（2026-07-27）
 
-**修复：U+3000 全角空格在注入过程中丢失（175 文件 239 个空格被删除）**
-
-- **根因**：IDML 中 U+3000 的 CSR 被赋予了 `CharacterStyle/句号` 样式，`_rebuild_paragraph_xml` 按样式名将其错误分类为 punct CSR。alignment 中 U+3000 记录 `is_punct=False` → `punct_segments` 为空 → 清空逻辑删除整个 CSR。
+**1. 修复：U+3000 全角空格在注入过程中丢失** — `436209a`
+- **根因**：IDML 中 U+3000 的 CSR 被赋予了 `CharacterStyle/句号` 样式，`_rebuild_paragraph_xml` 按样式名将其错误分类为 punct CSR。alignment 中 U+3000 记录 `is_punct=False` → `punct_segments` 为空 → 清空逻辑删除整个 CSR（175 文件 239 个丢失）。
 - **修复**：在 punct CSR 处理逻辑中新增 `text_segments` 检测 —— 当带有句号样式的 CSR 包含非标点内容时，fall through 到文字 CSR 逻辑，保留原内容。
-- **验证**：175 ✓ 31515 字符完全一致，275（回归）✓ 6754 字符完全一致
+
+**2. 新增：IDML 工具库独立模块 `code/idml_utils.py`** — `9597ef1`
+- 1582 行，28 个函数，按功能分 9 个区，可在其他项目中 `from idml_utils import ...` 复用。
+
+**3. 修复：句号 CSR 继承前邻文字前缀（PointSize 等）** — `9597ef1`
+- **根因**：句号使用全局 punct template，在双排小字场景中字号与上下文不一致。
+- **修复**：拆分 CSR 时，句号继承前邻文字 segment 的 CSR 前缀，仅从 punct_template 取 Content。
+
+**4. 修复：句号 CSR 强制使用思源宋体** — `a9e78be`
+- **根因**：经书粗宋/仿宋/楷体等字体缺少句号 glyph，回注后无法显示。
+- **修复**：句号继承前邻文字的 PointSize 等属性，但强制覆盖 AppliedFont 为思源宋体。
+- **验证**：3093 输出 929 个句号全部使用思源宋体，275/175 回归全部通过。
 
 ### 历史会话（续）
 
