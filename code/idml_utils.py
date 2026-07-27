@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
 """
-IDML 句读结果回注工具
-将 _WD句读结果.md 中的文字和「。」注入回 IDML，排版样式原封不动。
+IDML 工具库 — 独立的 IDML 解析、分析、注入、验证模块。
 
-用法:
-    python inject.py --idml 275导出.idml --result 275从ID中导出文字_WD句读结果.md
-    或拖拽两个文件到 inject.bat 上
+可在任意项目中导入使用：
+    from idml_utils import extract_from_idml, generate_idml, process
+
+核心功能分区：
+  【A】标点与空白工具    — _is_old_punct / _is_unicode_whitespace / _is_ws_for_compare
+  【B】字体检测与抑制    — _extract_font_from_csr / _is_suppress_target / _should_suppress_punct
+  【C】IDML 解析与提取   — extract_from_idml / _parse_story_order / _parse_story_xml / _parse_paragraph_style_range
+  【D】句读结果读取      — extract_from_result
+  【E】验证与字符对齐    — validate_and_align
+  【F】XML 重建          — _rebuild_paragraph_xml / _rebuild_story_xml / _xml_escape / _clear_content_keep_br / _clear_content_strip_br
+  【G】IDML 写回         — _write_stories_to_idml / generate_idml
+  【H】输出验证          — _verify_structure / _verify_br_count / _verify_output
+  【I】主流水线          — process
 """
 
 import sys
 import os
 import re
-import argparse
-import shutil
 import zipfile
 import unicodedata
 
@@ -89,13 +96,11 @@ _OLD_PUNCT_CHARS: set[str] = {
     '~',
 }
 
-
 def _is_old_punct(ch: str) -> bool:
     """判断字符是否为旧标点，即句读处理中需要从原文清除的标点符号。"""
     if len(ch) != 1:
         return False
     return ch in _OLD_PUNCT_CHARS
-
 
 # 目标字体集合 — 这些字体的字符后跟 U+3000 时，抑制 。 插入
 # 使用 startswith 前缀匹配：如 '思源宋体' 匹配 '思源宋体 CN'、'思源宋体 TW' 等所有变体
@@ -104,7 +109,6 @@ _SUPPRESS_PUNCT_FONTS: list[str] = [
     '仿宋',
     '楷体',
 ]
-
 
 def _extract_font_from_csr(csr_attrs: str, csr_inner: str) -> str | None:
     """从 CSR 的 XML 片段中提取 AppliedFont 名称。
@@ -117,13 +121,11 @@ def _extract_font_from_csr(csr_attrs: str, csr_inner: str) -> str | None:
     )
     return font_match.group(1) if font_match else None
 
-
 def _is_suppress_target(font: str | None) -> bool:
     """判断字体是否属于需要抑制 。 的目标字体（前缀匹配）。"""
     if font is None:
         return False
     return any(font.startswith(prefix) for prefix in _SUPPRESS_PUNCT_FONTS)
-
 
 def _should_suppress_punct(
     idml_idx: int,
@@ -184,7 +186,6 @@ def _should_suppress_punct(
 
     return False
 
-
 def _is_unicode_whitespace(ch: str) -> bool:
     """判断字符是否为 Unicode 空白/控制字符（IDML 中的布局空白）。
 
@@ -213,7 +214,6 @@ def _is_unicode_whitespace(ch: str) -> bool:
         pass
     return False
 
-
 def _is_ws_for_compare(ch: str) -> bool:
     """判断字符是否为比对时应忽略的空白。
 
@@ -226,135 +226,6 @@ def _is_ws_for_compare(ch: str) -> bool:
     if ord(ch) == 0x3000:
         return True
     return False
-
-
-def resolve_conflicts(conflicts: dict[str, str]) -> dict[str, str]:
-    """冲突检测与处理。
-
-    Args:
-        conflicts: {路径: 描述} 映射，如 {'output/275导出_WD注入.idml': '输出文件'}
-
-    Returns:
-        {路径: 操作} 映射，操作: 'overwrite' | 'rename_v2' | 'skip'
-    """
-    if not conflicts:
-        return {}
-
-    print("\n[!] 检测到以下文件已存在：\n")
-    items = list(conflicts.items())
-    for i, (path, desc) in enumerate(items, 1):
-        print(f"  [{i}] {path}")
-        print(f"      {desc}")
-
-    print("\n请选择处理方式：")
-    print("  A  全部覆盖")
-    print("  S  全部跳过")
-    print("  R  全部自动重命名（加 _v2, _v3 后缀）")
-    print("  C  逐个确认")
-
-    while True:
-        choice = input("\n> ").strip().upper()
-        result: dict[str, str] = {}
-
-        if choice == 'A':
-            return {path: 'overwrite' for path in conflicts}
-        elif choice == 'S':
-            return {path: 'skip' for path in conflicts}
-        elif choice == 'R':
-            return {path: 'rename_v2' for path in conflicts}
-        elif choice == 'C':
-            for path, desc in items:
-                while True:
-                    sub = input(f"  {path}\n  [O]覆盖 [S]跳过 [R]重命名 [Q]取消全部 > ").strip().upper()
-                    if sub == 'O':
-                        result[path] = 'overwrite'
-                        break
-                    elif sub == 'S':
-                        result[path] = 'skip'
-                        break
-                    elif sub == 'R':
-                        result[path] = 'rename_v2'
-                        break
-                    elif sub == 'Q':
-                        print("  已取消")
-                        sys.exit(0)
-            return result
-        else:
-            print("  无效选项，请重新输入")
-
-
-def _resolve_output_path(path: str, action: str) -> str | None:
-    """根据冲突处理结果返回最终输出路径。
-
-    Returns:
-        最终路径，或 None 表示跳过
-    """
-    if action == 'skip':
-        return None
-    if action == 'rename_v2':
-        base, ext = os.path.splitext(path)
-        v = 2
-        while os.path.exists(f"{base}_v{v}{ext}"):
-            v += 1
-        return f"{base}_v{v}{ext}"
-    return path  # overwrite
-
-
-def main():
-    parser = argparse.ArgumentParser(description="IDML 句读结果回注工具")
-    parser.add_argument("--idml", required=True, help="原始 IDML 文件路径")
-    parser.add_argument("--result", required=True, help="句读结果 MD 文件路径")
-    parser.add_argument("--output", help="输出 IDML 路径（默认自动生成）")
-    args = parser.parse_args()
-
-    # 输入文件存在性检查
-    if not os.path.isfile(args.idml):
-        print(f"错误: IDML 文件不存在: {args.idml}")
-        sys.exit(1)
-    if not os.path.isfile(args.result):
-        print(f"错误: 句读结果文件不存在: {args.result}")
-        sys.exit(1)
-
-    # IDML 文件基本校验（是否为有效 ZIP）
-    try:
-        with zipfile.ZipFile(args.idml, 'r') as zf:
-            if 'designmap.xml' not in zf.namelist():
-                print(f"错误: 文件不是有效的 IDML（缺少 designmap.xml）: {args.idml}")
-                sys.exit(1)
-    except zipfile.BadZipFile:
-        print(f"错误: 文件不是有效的 ZIP/IDML 文件: {args.idml}")
-        sys.exit(1)
-
-    if args.output is None:
-        base = os.path.splitext(args.idml)[0]
-        args.output = f"{base}_WD注入.idml"
-
-    print(f"输入 IDML: {args.idml}")
-    print(f"句读结果: {args.result}")
-    print(f"输出文件: {args.output}")
-
-    # 冲突检测
-    if os.path.exists(args.output):
-        conflicts = {args.output: "输出文件已存在"}
-        decisions = resolve_conflicts(conflicts)
-        resolved = _resolve_output_path(args.output, decisions[args.output])
-        if resolved is None:
-            print("已跳过")
-            sys.exit(0)
-        args.output = resolved
-
-    try:
-        process(args.idml, args.result, args.output)
-    except ValueError as e:
-        print(f"\n处理失败: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"\n未预期的错误: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-
-
 def extract_from_idml(idml_path: str) -> list[dict]:
     """
     从 IDML 中提取所有文字及其样式信息。
@@ -414,14 +285,12 @@ def extract_from_idml(idml_path: str) -> list[dict]:
 
     return stories
 
-
 def _parse_story_order(designmap_xml: str) -> list[str]:
     """从 designmap.xml 提取 StoryList 属性中的 Story 顺序"""
     match = re.search(r'StoryList="([^"]*)"', designmap_xml)
     if match:
         return match.group(1).split()
     return []
-
 
 def _verify_extraction(stories: list[dict], raw_story_xmls: dict[str, str]) -> None:
     """自检：确保解析器没有遗漏任何 Content 文本。
@@ -500,7 +369,6 @@ def _verify_extraction(stories: list[dict], raw_story_xmls: dict[str, str]) -> N
                 f"原始 XML {len(raw_str)} vs 解析器 {len(parsed_str)}"
             )
 
-
 def _parse_story_xml(story_xml: str, story_idx: int) -> list[dict]:
     """
     解析一个 Story XML，返回该 story 中的所有段落。
@@ -514,7 +382,6 @@ def _parse_story_xml(story_xml: str, story_idx: int) -> list[dict]:
         paragraphs.append({'chars': chars, 'raw_xml': psr_xml})
 
     return paragraphs
-
 
 def _parse_paragraph_style_range(
     psr_xml: str, story_idx: int, para_idx: int
@@ -583,14 +450,12 @@ def _parse_paragraph_style_range(
 
     return chars
 
-
 def _get_story_header(story_xml: str) -> str:
     """提取 Story XML 从开头到第一个 ParagraphStyleRange 之前的内容"""
     match = re.search(r'<ParagraphStyleRange', story_xml)
     if match:
         return story_xml[:match.start()]
     return story_xml
-
 
 def _get_story_footer(story_xml: str) -> str:
     """提取 Story XML 最后一个 ParagraphStyleRange 之后的内容"""
@@ -601,7 +466,6 @@ def _get_story_footer(story_xml: str) -> str:
     if last_end > 0:
         return story_xml[last_end:]
     return ''
-
 
 def extract_from_result(md_path: str) -> dict:
     """
@@ -641,7 +505,6 @@ def extract_from_result(md_path: str) -> dict:
                 para_breaks.add(len(chars))
 
     return {'chars': chars, 'para_breaks': para_breaks}
-
 
 def validate_and_align(stories: list[dict], result_data: dict) -> dict:
     """
@@ -846,7 +709,6 @@ def validate_and_align(stories: list[dict], result_data: dict) -> dict:
 
     return {'grouped': grouped, 'split_sources': new_split_sources}
 
-
 def _xml_escape(text: str) -> str:
     """转义 XML 特殊字符。
 
@@ -860,7 +722,6 @@ def _xml_escape(text: str) -> str:
     text = text.replace('"', '&quot;')
     text = text.replace("'", '&apos;')
     return text
-
 
 def _rebuild_paragraph_xml(
     original_psr_xml: str, new_char_records: list[dict],
@@ -1165,7 +1026,6 @@ def _rebuild_paragraph_xml(
 
     return result
 
-
 def _remove_empty_punct_csrs(xml: str, csr_pattern: str) -> str:
     """删除 Content 为空的句号 CSR。"""
     result = xml
@@ -1178,7 +1038,6 @@ def _remove_empty_punct_csrs(xml: str, csr_pattern: str) -> str:
         if all(c == '' for c in contents):
             result = result[:m.start()] + result[m.end():]
     return result
-
 
 def _insert_punct_csrs(
     xml: str, punct_records: list[dict], template: str
@@ -1235,7 +1094,6 @@ def _insert_punct_csrs(
 
     return result
 
-
 def _clear_content_keep_br(csr_xml: str, strip_groups: bool = False) -> str:
     """清空 CSR 的 Content 文本，保留 Br 标签和 CSR 结构。
 
@@ -1256,7 +1114,6 @@ def _clear_content_keep_br(csr_xml: str, strip_groups: bool = False) -> str:
         flags=re.DOTALL,
     )
     return result
-
 
 def _clear_content_strip_br(csr_xml: str, strip_groups: bool = False) -> str:
     """清空 CSR 的 Content 文本、移除 Br，保留基本 CSR 结构。
@@ -1279,7 +1136,6 @@ def _clear_content_strip_br(csr_xml: str, strip_groups: bool = False) -> str:
     )
     return result
 
-
 def _rebuild_story_xml(header: str, para_xmls: list[str], footer: str) -> str:
     """用重建的段落 XML 拼接完整的 Story XML。
 
@@ -1292,7 +1148,6 @@ def _rebuild_story_xml(header: str, para_xmls: list[str], footer: str) -> str:
         完整的 Story XML 字符串。
     """
     return header + '\n'.join(para_xmls) + footer
-
 
 def _write_stories_to_idml(idml_path: str, new_story_xmls: dict[str, str]) -> None:
     """将修改后的 Story XML 写回 IDML ZIP 文件。
@@ -1322,7 +1177,6 @@ def _write_stories_to_idml(idml_path: str, new_story_xmls: dict[str, str]) -> No
     with zipfile.ZipFile(idml_path, 'w', zipfile.ZIP_DEFLATED) as zf:
         for name, data in all_files.items():
             zf.writestr(name, data)
-
 
 def generate_idml(
     idml_path: str,
@@ -1433,7 +1287,6 @@ def generate_idml(
           f"{para_split_count} 个新段落（来自分割）")
 
     _write_stories_to_idml(output_path, new_story_xmls)
-
 
 def _verify_structure(
     input_path: str, output_path: str,
@@ -1601,7 +1454,6 @@ def _verify_structure(
             + f"\n（输出文件已删除: {output_path}）"
         )
 
-
 def _verify_br_count(input_path: str, output_path: str) -> None:
     """报告输入/输出 IDML 的 Br 数量变化。
 
@@ -1638,7 +1490,6 @@ def _verify_br_count(input_path: str, output_path: str) -> None:
 
     print(f"  Br 统计: 输入 {in_br_total} → 输出 {out_br_total}"
           f"（旧句号清除 {br_in_old_punct}, 清空文字 CSR 清除 {br_cleared_text}）")
-
 
 def _verify_output(output_path: str, expected_chars: list[str]) -> None:
     """输出自检：从生成的 IDML 重新提取字符序列并与输入比对。
@@ -1712,7 +1563,6 @@ def _verify_output(output_path: str, expected_chars: list[str]) -> None:
         f"\n（输出文件已删除: {output_path}）"
     )
 
-
 def process(idml_path, result_path, output_path):
     """主处理流程"""
     print("=" * 60)
@@ -1764,7 +1614,3 @@ def process(idml_path, result_path, output_path):
     print(f"\n{'=' * 60}")
     print(f"完成！输出文件: {output_path}")
     print(f"{'=' * 60}")
-
-
-if __name__ == "__main__":
-    main()
