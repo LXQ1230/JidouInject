@@ -978,8 +978,15 @@ def _rebuild_paragraph_xml(
                     else:
                         # 段首句号：回退到全局模板（极少见）
                         text_pfx = csr_prefix
+                    # 强制 AppliedFont 为思源宋体，确保句号在所有字体中正常显示。
+                    # 继承前邻文字的 PointSize 等属性（通过 text_pfx），但覆盖字体。
+                    text_pfx = re.sub(
+                        r'<AppliedFont\s+type="string">[^<]*</AppliedFont>',
+                        '<AppliedFont type="string">思源宋体</AppliedFont>',
+                        text_pfx,
+                    )
                     if punct_template:
-                        # 用 punct_template 的 Content 部分，但前缀用临近文字的前缀
+                        # 用 punct_template 的 Content 部分
                         tmpl_content = re.search(
                             r'<Content>.*?</Content>',
                             punct_template, re.DOTALL
