@@ -20,6 +20,8 @@ IDML 工具库 — 独立的 IDML 解析、分析、注入、验证模块。
 import sys
 import os
 import re
+import html
+import shutil
 import zipfile
 import unicodedata
 
@@ -309,6 +311,8 @@ def _verify_extraction(stories: list[dict], raw_story_xmls: dict[str, str]) -> N
         raw_contents = re.findall(r'<Content>(.*?)</Content>', raw_xml, re.DOTALL)
         # 去除加工指令（如 <?ACE 18?>），与解析器行为一致
         raw_text = re.sub(r'<\?.*?\?>', '', ''.join(raw_contents))
+        # 解码 HTML 十六进制实体，与解析器行为一致
+        raw_text = html.unescape(raw_text)
         # 模拟解析器的段落末尾全角空格去除：
         # 解析器在每个 ParagraphStyleRange 末尾去除尾随的 U+3000，
         # 这里按 ParagraphStyleRange 边界分割后各自 rstrip
@@ -321,6 +325,8 @@ def _verify_extraction(stories: list[dict], raw_story_xmls: dict[str, str]) -> N
                 r'<Content>(.*?)</Content>', psr_match.group(1), re.DOTALL
             )
             psr_text = re.sub(r'<\?.*?\?>', '', ''.join(psr_contents))
+            # 解码 HTML 十六进制实体，与解析器行为一致
+            psr_text = html.unescape(psr_text)
             # 去除段落末尾的全角空格（与解析器行为一致）
             psr_text = psr_text.rstrip('　')
             for ch in psr_text:
@@ -415,6 +421,10 @@ def _parse_paragraph_style_range(
         # 每个 <Content> → 一组字符，打上槽位标签
         for slot_idx, cm in enumerate(content_matches):
             content_text = cm.group(1)
+
+            # 解码 HTML 十六进制实体（如 &#xfdc4f; → U+FDC4F），
+            # 确保增补平面字符不会被当作多个 ASCII 字符处理
+            content_text = html.unescape(content_text)
 
             # 特殊加工指令（如 <?ACE 18?>）
             if re.match(r'<\?ACE\s', content_text):
