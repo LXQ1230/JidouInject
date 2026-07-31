@@ -98,10 +98,15 @@ def _is_old_punct(ch: str) -> bool:
     return ch in _OLD_PUNCT_CHARS
 
 
-# 目标字体集合 — 这些字体的字符后跟 U+3000 时，抑制 。 插入
+# 仅当同 CSR 内两字间有 U+3000 时才抑制 。 的字体（思源宋体）
 # 使用 startswith 前缀匹配：如 '思源宋体' 匹配 '思源宋体 CN'、'思源宋体 TW' 等所有变体
-_SUPPRESS_PUNCT_FONTS: list[str] = [
+_FONTS_SUPPRESS_WIDTH: list[str] = [
     '思源宋体',
+]
+
+# 前字或后字属于这些字体时无条件抑制 。（仿宋/楷体）
+# 使用 startswith 前缀匹配：如 '仿宋' 匹配 '经书仿宋1'、'方正仿宋 GB18030L2' 等所有变体
+_FONTS_SUPPRESS_ALWAYS: list[str] = [
     '仿宋',
     '楷体',
 ]
@@ -119,12 +124,48 @@ def _extract_font_from_csr(csr_attrs: str, csr_inner: str) -> str | None:
     return font_match.group(1) if font_match else None
 
 
-def _is_suppress_target(font: str | None) -> bool:
-    """判断字体是否属于需要抑制 。 的目标字体（前缀匹配）。"""
+def _is_suppress_width_target(font: str | None) -> bool:
+    """检查字体是否属于仅限 U+3000 间隔抑制的目标（思源宋体）。前缀匹配。"""
     if font is None:
         return False
-    return any(font.startswith(prefix) for prefix in _SUPPRESS_PUNCT_FONTS)
+    return any(font.startswith(prefix) for prefix in _FONTS_SUPPRESS_WIDTH)
 
+def _is_suppress_always_target(font: str | None) -> bool:
+    """检查字体是否属于无条件抑制的目标（仿宋/楷体）。包含匹配。
+
+    用 in 而非 startswith：实际字体名如 '经书仿宋1'、'方正仿宋 GB18030L2'、
+    '法藏仿宋'、'经书楷体2' 等，核心字通常在中间而非前缀。
+    """
+    if font is None:
+        return False
+    return any(keyword in font for keyword in _FONTS_SUPPRESS_ALWAYS)
+
+
+def _get_prev_non_ws_font(
+    idml_idx: int,
+    idml_clean_indices: list[int],
+    all_idml_records: list[dict],
+) -> str | None:
+    """从 idml_idx 往回找上一个非空白文字字符，返回其字体名。"""
+    for j in range(idml_idx - 1, -1, -1):
+        ti = idml_clean_indices[j]
+        rec = all_idml_records[ti]
+        if not _is_ws_for_compare(rec['char']):
+            return rec.get('font')
+    return None
+
+def _get_next_non_ws_font(
+    idml_idx: int,
+    idml_clean_indices: list[int],
+    all_idml_records: list[dict],
+) -> str | None:
+    """从 idml_idx 向前找下一个非空白文字字符，返回其字体名。"""
+    for j in range(idml_idx, len(idml_clean_indices)):
+        ti = idml_clean_indices[j]
+        rec = all_idml_records[ti]
+        if not _is_ws_for_compare(rec['char']):
+            return rec.get('font')
+    return None
 
 def _should_suppress_punct(
     idml_idx: int,
@@ -132,51 +173,71 @@ def _should_suppress_punct(
     all_idml_records: list[dict],
     last_slot: tuple | None,
 ) -> bool:
-    """判断 WD 结果中的 。 是否应被抑制（替换为 U+3000）。
+    """判断 WD 结果中的 。 是否应被抑制。
 
-    条件：下一个 IDML 文字字符匹配以下规则：
-    1. 与上一个文字字符在同一 CSR 内（csr_idx 相同）
-    2. 该 CSR 的字体是目标字体之一（思源宋体/仿宋/楷体）
-    3. 上一个字符与下一个字符之间在 IDML 中有一位 U+3000 间隔
+    规则 A（仿宋/楷体 — 区域内抑制）：
+        前字属于仿宋/楷体 → 无条件抑制 （无论后字是什么）。
+        后字属于仿宋/楷体 且 前字不是仿宋/楷体 → 思源散文→仿宋偈颂过渡边界，
+        句号属于散文侧语法标点，不抑制。
+        段首句号（无前字）+ 后字仿宋/楷体 → 抑制。
 
-    这保留了偈颂/目录中 U+3000 空格间隔的原样排版。
+    规则 B（思源宋体 — 仅 U+3000 间隔抑制）：
+        同 CSR + 思源宋体 + 两字间有 U+3000 → 抑制 。。
+        保留偈颂/目录中 U+3000 空格间隔的原样排版。
     """
     if last_slot is None:
         return False
+
+    font_prev = _get_prev_non_ws_font(idml_idx, idml_clean_indices,
+                                       all_idml_records)
+    font_next = _get_next_non_ws_font(idml_idx, idml_clean_indices,
+                                       all_idml_records)
+
+    is_prev_always = _is_suppress_always_target(font_prev)
+    is_next_always = _is_suppress_always_target(font_next)
+
+    # 前字是仿宋/楷体 → 无条件抑制
+    if is_prev_always:
+        return True
+
+    # 后字是仿宋/楷体 且 前字不是 → 思源→仿宋过渡边界，放行
+    if is_next_always and not is_prev_always:
+        if font_prev is None:
+            return True   # 段首句号 + 仿宋后字 → 抑制
+        return False      # 思源散文末尾句号 → 放行
+
+    # ── 规则B：思源宋体 — U+3000 间隔抑制（现有逻辑） ──
     if idml_idx >= len(idml_clean_indices):
         return False
 
-    # 找下一个 IDML 文字字符
+    # 找下一个 IDML 文字字符（含其索引，供 U+3000 扫描）
     next_idx = None
+    next_rec = None
     for j in range(idml_idx, len(idml_clean_indices)):
         ti = idml_clean_indices[j]
         rec = all_idml_records[ti]
         if not _is_ws_for_compare(rec['char']):
             next_idx = j
+            next_rec = rec
             break
 
-    if next_idx is None:
+    if next_rec is None:
         return False
 
-    next_ti = idml_clean_indices[next_idx]
-    next_rec = all_idml_records[next_ti]
     prev_si, prev_pi, prev_ci, prev_sl = last_slot
 
     # 同 CSR？
     if next_rec['csr_idx'] != prev_ci:
         return False
-
     # 同 story/para？
     if next_rec['story_idx'] != prev_si:
         return False
     if next_rec['para_idx'] != prev_pi:
         return False
-
-    # 字体是目标？
-    if not _is_suppress_target(next_rec.get('font')):
+    # 字体是思源宋体？
+    if not _is_suppress_width_target(next_rec.get('font')):
         return False
-
-    # 两者之间有没有 U+3000？（查看两者在 idml_clean_indices 区间内的记录）
+    # 两者之间有没有 U+3000？
     for j in range(idml_idx, next_idx):
         ti = idml_clean_indices[j]
         rec = all_idml_records[ti]

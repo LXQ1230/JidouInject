@@ -42,8 +42,8 @@ def find_pairs():
 
     规则：
     - IDML：*.idml 即可
-    - MD：  *句读结果.md 即可
-    - TXT： *句读结果.txt 即可
+    - MD/TXT：*.md 或 *.txt 即可（不要求包含"句读结果"字样）
+    - 排除注入输出文件（含 _WD注入 的文件）
     - 配对：提取文件名开头的数字（经号），相同经号即配为一对
     """
     if not os.path.isdir(PENDING_DIR):
@@ -62,10 +62,10 @@ def find_pairs():
                 continue
             idml_by_number.setdefault(num, []).append(f)
 
-    # 按经号分组 MD/TXT
+    # 按经号分组 MD/TXT（排除注入输出文件 _WD注入）
     md_by_number: dict[str, list[str]] = {}
     for f in all_files:
-        if f.endswith("句读结果.md") or f.endswith("句读结果.txt"):
+        if (f.endswith(".md") or f.endswith(".txt")) and "_WD注入" not in f:
             num = _extract_number(f)
             if num is None:
                 print(f"警告: {f} 文件名无经号，跳过")
