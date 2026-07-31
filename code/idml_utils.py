@@ -104,10 +104,11 @@ def _is_old_punct(ch: str) -> bool:
         return False
     return ch in _OLD_PUNCT_CHARS
 
-# 仅当同 CSR 内两字间有 U+3000 时才抑制 。 的字体（思源宋体）
-# 使用 startswith 前缀匹配：如 '思源宋体' 匹配 '思源宋体 CN'、'思源宋体 TW' 等所有变体
+# 仅当同 CSR 内两字间有 U+3000 时才抑制 。 的字体（思源宋体/法藏大宋）
+# 使用 startswith 前缀匹配：如 '思源宋体' 匹配 '思源宋体 CN'、'FaZangDaSong' 匹配 'FaZangDaSong SC'
 _FONTS_SUPPRESS_WIDTH: list[str] = [
     '思源宋体',
+    'FaZangDaSong',
 ]
 
 # 前字或后字属于这些字体时无条件抑制 。（仿宋/楷体）
