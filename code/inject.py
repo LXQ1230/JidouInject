@@ -822,6 +822,16 @@ def extract_from_result(md_path: str) -> dict:
             if chars:
                 para_breaks.add(len(chars))
 
+    # FIX-1B（P0）: 句读结果身份强校验 — AI 句读结果文件应只含文字 + 「。」。
+    # 若含「。以外」的旧标点（，、；：！？等），说明疑似以原文导出文本冒充
+    # 句读结果（原文标点以 。 为主，可令旧校验自洽通过，造成静默错误注入）。
+    for ch in chars:
+        if _is_old_punct(ch) and ch != '。':
+            raise ValueError(
+                f"句读结果文件含非句号旧标点「{ch}」(U+{ord(ch):04X})，"
+                f"疑似以原文导出文本冒充句读结果，已拒绝。"
+                f"请确认为真正的句读结果文件（仅文字+句号）。")
+
     return {'chars': chars, 'para_breaks': para_breaks}
 
 
@@ -2038,6 +2048,24 @@ def process(idml_path, result_path, output_path):
     alignment = validate_and_align(stories, result_data)
     grouped_records = alignment['grouped']
     split_sources = alignment['split_sources']
+
+    # FIX-1C（P0）: 句号重合度预警 — 结果文件命名不含"句读结果"字样，
+    # 且句号数量与 IDML 原旧句号数量相差 <5% 时，疑似以原文导出文本当结果。
+    # （修复 B 已拦截含非句号旧标点的文件；此处兜底纯句号原文的漏网场景）
+    idml_dot_count = sum(
+        1 for story in stories for para in story['paragraphs']
+        for rec in para['chars'] if rec['char'] == '。'
+    )
+    result_dot_count = sum(1 for c in result_chars if c == '。')
+    result_base = os.path.basename(result_path)
+    if "句读结果" not in result_base and idml_dot_count > 0:
+        dot_diff_ratio = abs(idml_dot_count - result_dot_count) / idml_dot_count
+        if dot_diff_ratio < 0.05:
+            print(
+                f"\n[!] 警告: 结果文件「{result_base}」命名不含「句读结果」字样，"
+                f"且其句号数量（{result_dot_count}）与 IDML 原旧句号"
+                f"（{idml_dot_count}）高度重合（差异 {dot_diff_ratio*100:.1f}% < 5%），"
+                f"疑似以原文导出文本冒充句读结果，请人工确认后重跑。")
 
     # Step 4: 生成输出
     print("\n[4/5] 生成输出 IDML...")

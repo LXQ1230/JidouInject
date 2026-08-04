@@ -37,13 +37,23 @@ def _extract_number(filename: str) -> str | None:
     return m.group(1) if m else None
 
 
+# 测试/演练文件模式：批量配对时必须排除，防止把测试产物当正式输入
+_TEST_PATTERNS: tuple[str, ...] = ('_old_test', '_test')
+
+
+def _is_excluded_test_file(f: str) -> bool:
+    """判断文件名是否属于测试/演练产物（*_old_test* / *_test*）。"""
+    return any(p in f for p in _TEST_PATTERNS)
+
+
 def find_pairs():
     """扫描 pending/ 目录，按经号配对 IDML 和句读结果文件。
 
     规则：
     - IDML：*.idml 即可
-    - MD/TXT：*.md 或 *.txt 即可（不要求包含"句读结果"字样）
-    - 排除注入输出文件（含 _WD注入 的文件）
+    - MD/TXT：*.md 或 *.txt，且文件名必须包含"句读结果"字样
+      （强校验句读结果身份，排除 *导出.txt 等原文导出文本冒充结果）
+    - 排除注入输出文件（含 _WD注入）与测试文件（*_test* / *_old_test*）
     - 配对：提取文件名开头的数字（经号），相同经号即配为一对
     """
     if not os.path.isdir(PENDING_DIR):
@@ -52,20 +62,24 @@ def find_pairs():
 
     all_files = os.listdir(PENDING_DIR)
 
-    # 按经号分组 IDML（排除注入输出文件 _WD注入.idml）
+    # 按经号分组 IDML（排除注入输出文件 _WD注入.idml、测试文件）
     idml_by_number: dict[str, list[str]] = {}
     for f in all_files:
-        if f.endswith(".idml") and "_WD注入" not in f:
+        if f.endswith(".idml") and "_WD注入" not in f \
+           and not _is_excluded_test_file(f):
             num = _extract_number(f)
             if num is None:
                 print(f"警告: {f} 文件名无经号，跳过")
                 continue
             idml_by_number.setdefault(num, []).append(f)
 
-    # 按经号分组 MD/TXT（排除注入输出文件 _WD注入）
+    # 按经号分组 MD/TXT（强校验句读结果身份：文件名必须含"句读结果"，
+    # 排除导出原文 *导出.txt 与注入输出 _WD注入、测试文件）
     md_by_number: dict[str, list[str]] = {}
     for f in all_files:
-        if (f.endswith(".md") or f.endswith(".txt")) and "_WD注入" not in f:
+        if (f.endswith(".md") or f.endswith(".txt")) \
+           and "句读结果" in f and "_WD注入" not in f \
+           and not _is_excluded_test_file(f):
             num = _extract_number(f)
             if num is None:
                 print(f"警告: {f} 文件名无经号，跳过")
@@ -113,7 +127,12 @@ def collect_conflicts(pairs):
         done_path = os.path.join(DONE_DIR, name, out_file)
         if os.path.exists(done_path):
             conflicts[done_path] = f"done/{name}/ 归档"
-        # pending 源文件不会冲突（本来就是从这里读的）
+        # pending 源文件 → done 归档目标（防归档时覆盖旧归档/旧源文件）
+        for f in os.listdir(PENDING_DIR):
+            if _extract_number(f) == name:
+                src_dst = os.path.join(DONE_DIR, name, f)
+                if os.path.exists(src_dst):
+                    conflicts[src_dst] = f"done/{name}/ 源文件归档"
     return conflicts
 
 
@@ -135,10 +154,20 @@ def process_one(idml_path, result_path, name, output_path):
         os.chdir(old_cwd)
 
 
-def archive(name, decisions):
-    """归档到 done/ + injected/"""
-    out_file = f"{name}导出_WD注入.idml"
-    out_src = os.path.join(OUTPUT_DIR, out_file)
+def archive(name, decisions, actual_out_path=None):
+    """归档到 done/ + injected/
+
+    Args:
+        actual_out_path: 本轮实际写出的输出文件路径（可能是 _v2 重命名后的
+            路径）。由 main() 传入，避免按固定名 {name}导出_WD注入.idml
+            查找导致 rename_v2 后归档丢失。
+    """
+    if actual_out_path is None:
+        out_file = f"{name}导出_WD注入.idml"
+        out_src = os.path.join(OUTPUT_DIR, out_file)
+    else:
+        out_src = actual_out_path
+        out_file = os.path.basename(actual_out_path)
     done_dir = os.path.join(DONE_DIR, name)
 
     if not os.path.isfile(out_src):
@@ -147,22 +176,40 @@ def archive(name, decisions):
 
     os.makedirs(done_dir, exist_ok=True)
 
-    # output → injected
-    inj_dst = os.path.join(INJECTED_DIR, out_file)
-    _smart_copy(out_src, inj_dst, decisions.get(inj_dst, 'overwrite'))
+    warnings: list[str] = []
 
-    # output → done
-    done_dst = os.path.join(done_dir, out_file)
-    _smart_move(out_src, done_dst, decisions.get(done_dst, 'overwrite'))
+    def _step_injected():
+        inj_dst = os.path.join(INJECTED_DIR, out_file)
+        _smart_copy(out_src, inj_dst, decisions.get(inj_dst, 'overwrite'))
 
-    # pending 源文件 → done
-    for f in os.listdir(PENDING_DIR):
-        if _extract_number(f) == name:
-            src = os.path.join(PENDING_DIR, f)
-            dst = os.path.join(done_dir, f)
-            _smart_move(src, dst, decisions.get(dst, 'overwrite'))
+    def _step_done():
+        done_dst = os.path.join(done_dir, out_file)
+        _smart_move(out_src, done_dst, decisions.get(done_dst, 'overwrite'))
 
-    print(f"  已归档 → done/{name}/ + injected/")
+    def _step_pending():
+        for f in os.listdir(PENDING_DIR):
+            if _extract_number(f) == name:
+                src = os.path.join(PENDING_DIR, f)
+                dst = os.path.join(done_dir, f)
+                _smart_move(src, dst, decisions.get(dst, 'overwrite'))
+
+    # 每个归档步骤独立 try/except：单步失败仅记入警告，不中断其余步骤
+    for step_name, step_fn in (
+        ('injected 汇总', _step_injected),
+        ('done 归档', _step_done),
+        ('pending 源文件归档', _step_pending),
+    ):
+        try:
+            step_fn()
+        except Exception as e:
+            warnings.append(f"{step_name}: {e}")
+            print(f"  归档步骤失败（已跳过）: {step_name}: {e}")
+
+    if warnings:
+        print(f"  已归档 → done/{name}/ + injected/ "
+              f"（{len(warnings)} 个步骤失败已跳过）")
+    else:
+        print(f"  已归档 → done/{name}/ + injected/")
 
 
 def _smart_copy(src, dst, action):
@@ -175,12 +222,20 @@ def _smart_copy(src, dst, action):
 
 
 def _smart_move(src, dst, action):
-    """智能移动，处理冲突"""
+    """智能移动，处理冲突。
+
+    优先 os.replace（同盘原子覆盖，不再因目标存在抛 FileExistsError）；
+    跨盘失败时回退为 copy2 + remove（同盘安全，不产生半文件）。
+    """
     if os.path.exists(dst):
         dst = _resolve_output_path(dst, action)
         if dst is None:
             return
-    shutil.move(src, dst)
+    try:
+        os.replace(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+        os.remove(src)
 
 
 def main():
@@ -233,7 +288,9 @@ def main():
 
         ok, elapsed = process_one(idml, md, name, out_path)
         if ok:
-            archive(name, decisions)
+            # FIX-2: 传入实际写出的 out_path（可能是 _v2 重命名后的路径），
+            # 保证 rename_v2 场景下归档不丢失
+            archive(name, decisions, actual_out_path=out_path)
             results.append((name, "✓", f"{elapsed:.1f}s"))
         else:
             results.append((name, "✗", "-"))
