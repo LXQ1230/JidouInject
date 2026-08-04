@@ -2,7 +2,7 @@
 """
 test_zip_stream.py — 第 1 层（ZIP 按需读写）专项验证
 
-验证 _stream_write_idml / generate_idml 的流式写回：
+验证 generate_idml 的流式写回：
 1. 输出成员集合与输入一致
 2. 成员顺序一致（mimetype 首位）
 3. mimetype 保持 STORED（compress_type=0）
@@ -10,6 +10,9 @@ test_zip_stream.py — 第 1 层（ZIP 按需读写）专项验证
 5. 修改的 Story 内容正确写入
 6. 压缩方式逐成员保留
 7. 真实样本 generate_idml 集成：文字零改动 + ZIP 结构正确
+
+注：2026-08-04（P3-3）起测试改走 generate_idml（_stream_write_idml
+独立函数已删除，其流式写回机制由 generate_idml 内联承担）。
 
 用法:
     python code/test_zip_stream.py
@@ -52,24 +55,37 @@ def make_fake_idml(path: str) -> dict:
                '</CharacterStyleRange></ParagraphStyleRange></Story>')
     with zipfile.ZipFile(path, 'w') as zf:
         zf.writestr(zipfile.ZipInfo('mimetype'), 'application/vnd.adobe.idml')
-        zf.writestr('designmap.xml', '<DesignMap><StoryList>u001 u002</StoryList></DesignMap>')
+        # designmap 用真实 IDML 属性格式（StoryList="..."），
+        # 否则 _parse_story_order 无法匹配导致 stories 解析为空
+        zf.writestr('designmap.xml',
+                    '<DesignMap><StoryList Self="u000" StoryList="u001 u002"/></DesignMap>')
         zf.writestr('Stories/Story_u001.xml', story_a)
         zf.writestr('Stories/Story_u002.xml', story_b)
     return {'u001': story_a, 'u002': story_b}
 
 
 def test_stream_write_basic() -> None:
-    """_stream_write_idml 基本行为"""
-    print("\n[1] _stream_write_idml 基本行为")
+    """generate_idml 基本写回行为（替换单个 Story，其余流式拷贝）"""
+    print("\n[1] generate_idml 基本行为")
     tmp_dir = os.path.join(PROJECT_ROOT, "output")
     os.makedirs(tmp_dir, exist_ok=True)
     src = os.path.join(tmp_dir, "_ztest_src.idml")
     dst = os.path.join(tmp_dir, "_ztest_dst.idml")
     originals = make_fake_idml(src)
 
-    # 替换 Story_u002
-    new_b = originals['u002'].replace('南無觀世音菩薩', '南無觀世音菩薩。')
-    inject._stream_write_idml(src, dst, {'u002': new_b})
+    # 构造对齐记录：Story_u002（story_idx=1）重建为「南無觀世音菩薩。」
+    stories = inject.extract_from_idml(src)
+    records = []
+    for i, ch in enumerate('南無觀世音菩薩'):
+        records.append(inject.CharRecord(
+            char=ch, is_punct=False, is_special=False,
+            story_idx=1, para_idx=0, csr_idx=0, content_slot=0, slot_pos=i))
+    records.append(inject.CharRecord(
+        char='。', is_punct=True, is_special=False,
+        story_idx=1, para_idx=0, csr_idx=-1, content_slot=-1,
+        after_csr=0, after_slot=0, after_pos=5))
+    grouped = {1: {0: records}}
+    inject.generate_idml(src, stories, grouped, {}, dst)
 
     with zipfile.ZipFile(dst) as zf:
         names = zf.namelist()
@@ -85,9 +101,12 @@ def test_stream_write_basic() -> None:
         # 4. 未修改成员逐字节一致
         ok = zf.read('Stories/Story_u001.xml') == originals['u001'].encode('utf-8')
         check("未修改成员逐字节一致", ok)
-        # 5. 修改的 Story 内容正确
-        ok = zf.read('Stories/Story_u002.xml').decode('utf-8') == new_b
-        check("修改 Story 内容正确", ok)
+        # 5. 修改的 Story 内容正确（v2.0 槽内插句号：逐字符拆分 + 句号）
+        new_xml = zf.read('Stories/Story_u002.xml').decode('utf-8')
+        contents = re.findall(r'<Content>(.*?)</Content>', new_xml)
+        check("修改 Story 内容正确",
+              contents == ['南', '無', '觀', '世', '音', '菩', '薩', '。'],
+              new_xml[:120])
         # 6. 压缩方式逐成员保留
         ok = all(o.compress_type == n.compress_type
                  for o, n in zip(
@@ -102,13 +121,14 @@ def test_stream_write_basic() -> None:
 
 
 def test_stream_idempotent() -> None:
-    """空更新（story_updates={}）→ 输出与输入完全等价"""
+    """空更新（grouped={}）→ 输出与输入完全等价（全量流式拷贝）"""
     print("\n[2] 空更新幂等性")
     tmp_dir = os.path.join(PROJECT_ROOT, "output")
     src = os.path.join(tmp_dir, "_ztest_src2.idml")
     dst = os.path.join(tmp_dir, "_ztest_dst2.idml")
     originals = make_fake_idml(src)
-    inject._stream_write_idml(src, dst, {})
+    stories = inject.extract_from_idml(src)
+    inject.generate_idml(src, stories, {}, {}, dst)
 
     with zipfile.ZipFile(src) as zf1, zipfile.ZipFile(dst) as zf2:
         n1, n2 = zf1.namelist(), zf2.namelist()
@@ -126,7 +146,7 @@ def test_generate_idml_real_sample() -> None:
     """真实样本 generate_idml 集成：文字零改动 + ZIP 结构正确"""
     print("\n[3] 真实样本 generate_idml 集成")
     idml_path = os.path.join(PROJECT_ROOT, "source", "3093偈颂测试.idml")
-    result_path = os.path.join(PROJECT_ROOT, "3093偈颂测试.txt")
+    result_path = os.path.join(PROJECT_ROOT, "source", "3093偈颂测试.txt")
     out_path = os.path.join(PROJECT_ROOT, "output", "_ztest_3093.idml")
     if not os.path.exists(idml_path) or not os.path.exists(result_path):
         check("3093 样本存在", False, "跳过")

@@ -1,0 +1,5 @@
+# JidouInject 依赖声明
+# 纯标准库实现（Python 3.10+），无第三方运行时依赖。
+# 测试/开发工具（可选）：
+#   pytest            # 运行 code/test_*.py
+#   ruff              # 代码规范检查

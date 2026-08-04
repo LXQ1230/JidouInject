@@ -161,7 +161,10 @@ def process_one(idml_path, result_path, name, output_path):
         elapsed = time.time() - start
         return True, elapsed
     except Exception as e:
+        # P3-6: 打印完整 traceback 便于定位问题（仅打印消息难以排查）
+        import traceback
         print(f"  处理失败: {e}")
+        traceback.print_exc()
         return False, 0
     finally:
         os.chdir(old_cwd)

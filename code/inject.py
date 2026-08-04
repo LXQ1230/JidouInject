@@ -133,6 +133,27 @@ def _is_old_punct(ch: str) -> bool:
     return ch in _OLD_PUNCT_CHARS
 
 
+# P3-11: 非法 HTML 实体替换计数器。
+# html.unescape 对非法实体（保留码位/超范围等）输出 U+FFFD 替换字符，
+# 需计数并警告，防止静默的字符损坏进入输出。
+_REPLACEMENT_COUNT: dict[str, int] = {'replaced': 0}
+
+
+def _unescape_entities(text: str) -> str:
+    """解码 HTML 实体；统计被替换为 U+FFFD 的非法实体（P3-11）。
+
+    0080 等经书使用合法十六进制实体（如 &#xfdc4f;）表示增补平面字符，
+    html.unescape 正常解码不产生 U+FFFD。仅当实体非法时才替换为 U+FFFD。
+    """
+    decoded = html.unescape(text)
+    if '\ufffd' in decoded and '\ufffd' not in text:
+        n = decoded.count('\ufffd')
+        _REPLACEMENT_COUNT['replaced'] += n
+        print(f"  [警告] 检测到 {n} 个非法 HTML 实体被替换为 U+FFFD"
+              f"（字符可能损坏，请检查 IDML 来源）")
+    return decoded
+
+
 # 仅当同 CSR 内两字间有 U+3000 时才抑制 。 的字体（思源宋体/法藏大宋）
 # 使用 startswith 前缀匹配：如 '思源宋体' 匹配 '思源宋体 CN'、'FaZangDaSong' 匹配 'FaZangDaSong SC'
 _FONTS_SUPPRESS_WIDTH: list[str] = [
@@ -370,8 +391,20 @@ def resolve_conflicts(conflicts: dict[str, str]) -> dict[str, str]:
     print("  R  全部自动重命名（加 _v2, _v3 后缀）")
     print("  C  逐个确认")
 
+    def _ask(prompt: str) -> str:
+        """读取用户输入；无 TTY（管道/CI）时 EOFError → 返回空串（默认跳过）。
+
+        P3-5: 批处理脚本在非交互环境运行时 input() 会抛 EOFError，
+        默认按「全部跳过」处理，避免进程崩溃。
+        """
+        try:
+            return input(prompt).strip().upper()
+        except EOFError:
+            print("  [提示] 非交互环境无输入，默认全部跳过")
+            return 'S'
+
     while True:
-        choice = input("\n> ").strip().upper()
+        choice = _ask("\n> ")
         result: dict[str, str] = {}
 
         if choice == 'A':
@@ -383,7 +416,9 @@ def resolve_conflicts(conflicts: dict[str, str]) -> dict[str, str]:
         elif choice == 'C':
             for path, desc in items:
                 while True:
-                    sub = input(f"  {path}\n  [O]覆盖 [S]跳过 [R]重命名 [Q]取消全部 > ").strip().upper()
+                    sub = _ask(
+                        f"  {path}\n"
+                        f"  [O]覆盖 [S]跳过 [R]重命名 [Q]取消全部 > ")
                     if sub == 'O':
                         result[path] = 'overwrite'
                         break
@@ -529,6 +564,15 @@ def _mem_suffix() -> str:
     return f"  内存峰值 {info['peak_rss_mb']:.0f} MB / 当前 {info['rss_mb']:.0f} MB"
 
 
+def _log_progress(s: str) -> None:
+    """进度输出（P3-8）：TTY 用 \\r 覆盖式进度条，非 TTY（管道/日志/CI）
+    退化为普通换行日志，避免输出被 \\r 覆盖丢失或污染日志流。"""
+    if sys.stdout.isatty():
+        print(s, end='', flush=True)
+    else:
+        print(s, flush=True)
+
+
 class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
     _fields_ = [
         ("cb", ctypes.c_ulong),
@@ -610,10 +654,10 @@ def extract_from_idml(
                 'paragraphs': paragraphs,
             })
             if n_order > 10:
-                # 大文件：逐 Story 显示解析进度
-                print(f"\r  解析 Story [{story_idx + 1}/{n_order}] "
-                      f"{story_name}  {_progress_bar(story_idx + 1, n_order)}",
-                      end='', flush=True)
+                # 大文件：逐 Story 显示解析进度（TTY 覆盖式 / 非 TTY 普通日志）
+                _log_progress(
+                    f"\r  解析 Story [{story_idx + 1}/{n_order}] "
+                    f"{story_name}  {_progress_bar(story_idx + 1, n_order)}")
         if n_order > 10:
             print()
 
@@ -764,7 +808,8 @@ def _parse_paragraph_style_range(
 
             # 解码 HTML 十六进制实体（如 &#xfdc4f; → U+FDC4F），
             # 确保增补平面字符不会被当作多个 ASCII 字符处理
-            content_text = html.unescape(content_text)
+            # （P3-11: 非法实体替换为 U+FFFD 时计数并警告）
+            content_text = _unescape_entities(content_text)
 
             # 特殊加工指令（如 <?ACE 18?>）
             if re.match(r'<\?ACE\s', content_text):
@@ -1472,76 +1517,6 @@ def _rebuild_paragraph_xml(
     return result
 
 
-def _remove_empty_punct_csrs(xml: str, csr_pattern: str) -> str:
-    """删除 Content 为空的句号 CSR。"""
-    result = xml
-    # 从后往前删除，避免位置偏移
-    for m in reversed(list(re.finditer(csr_pattern, xml, re.DOTALL))):
-        attrs = m.group(1)
-        if 'CharacterStyle/句号' not in attrs:
-            continue
-        contents = re.findall(r'<Content>(.*?)</Content>', m.group(0), re.DOTALL)
-        if all(c == '' for c in contents):
-            result = result[:m.start()] + result[m.end():]
-    return result
-
-
-def _insert_punct_csrs(
-    xml: str, punct_records: list[dict], template: str
-) -> str:
-    """将句号 CSR 插入到 XML 中对应 text CSR 之后。"""
-    # 按 after_csr 分组，从后往前插入，保持位置稳定
-    punct_after: dict[int, list[dict]] = {}
-    for prec in punct_records:
-        ci = prec.get('after_csr', -1)
-        if ci < 0:
-            continue
-        punct_after.setdefault(ci, []).append(prec)
-
-    if not punct_after:
-        return xml
-
-    # 找到每个 csr_idx 对应的 </CharacterStyleRange> 位置
-    csr_pattern = r'<CharacterStyleRange([^>]*?)(?:>(.*?)</CharacterStyleRange>|/>)'
-    csr_closes = []  # [(csr_idx, close_pos), ...]
-    csr_idx = 0
-    for csr_match in re.finditer(csr_pattern, xml, re.DOTALL):
-        attrs = csr_match.group(1)
-        is_punct_csr = (
-            'CharacterStyle/句号' in attrs
-            or ''.join(slot_contents) == '。'
-        )
-        end_pos = csr_match.end()
-        csr_closes.append((csr_idx, end_pos, is_punct_csr))
-        csr_idx += 1
-
-    # 从后往前插入
-    result = xml
-    for ci in sorted(punct_after.keys(), reverse=True):
-        # 找到 csr_idx=ci 的 CSR 结束位置。跳过旧句号 CSR（已被清空）
-        close_pos = None
-        for idx, pos, is_punct in csr_closes:
-            if idx == ci:
-                close_pos = pos
-                break
-        if close_pos is None:
-            continue
-        # 在 close_pos 处插入该 csr 后跟的所有句号 CSR
-        tail = ''.join(template for _ in punct_after[ci])
-        result = result[:close_pos] + tail + result[close_pos:]
-
-    # 处理 after_csr=-1 的句号（应该没有），放末尾
-    overflow = [p for p in punct_records if p.get('after_csr', -1) < 0]
-    if overflow:
-        tail = ''.join(template for _ in overflow)
-        last_close = result.rfind('</CharacterStyleRange>')
-        if last_close >= 0:
-            insert_pos = result.find('>', last_close) + 1
-            result = result[:insert_pos] + tail + result[insert_pos:]
-
-    return result
-
-
 def _clear_content_keep_br(csr_xml: str, strip_groups: bool = False) -> str:
     """清空 CSR 的 Content 文本，保留 Br 标签和 CSR 结构。
 
@@ -1625,52 +1600,6 @@ def _rebuild_story_xml(header: str, para_xmls: list[str], footer: str) -> str:
         完整的 Story XML 字符串。
     """
     return header + '\n'.join(para_xmls) + footer
-
-
-def _stream_write_idml(
-    src_path: str,
-    dst_path: str,
-    story_updates: dict[str, str],
-    progress_cb=None,
-) -> None:
-    """流式写回 IDML：未修改成员流式拷贝，指定 Story 直写新 XML。
-
-    与旧版 _write_stories_to_idml 不同：不再把整个 ZIP 全量读入内存，
-    内存占用 O(最大单个成员)。未修改成员按原 ZipInfo 流式复制，
-    保留其压缩方式、时间戳与扩展属性。
-
-    参数:
-        src_path: 源 IDML 文件路径。
-        dst_path: 输出 IDML 文件路径（先写临时文件再原子替换）。
-        story_updates: 映射 story_name -> 新的 Story XML 字符串。
-        progress_cb: 可选回调 progress_cb(done, total, name, bytes_total)。
-    """
-    tmp_path = dst_path + '.tmp'
-    bytes_total = 0
-    try:
-        with zipfile.ZipFile(src_path, 'r') as in_zf, \
-             zipfile.ZipFile(tmp_path, 'w') as out_zf:
-            infos = in_zf.infolist()
-            n_total = len(infos)
-            for i, zinfo in enumerate(infos, 1):
-                name = zinfo.filename
-                m = re.match(r'^Stories/Story_(.+)\.xml$', name)
-                if m and m.group(1) in story_updates:
-                    new_xml = story_updates[m.group(1)]
-                    out_zf.writestr(zinfo, new_xml.encode('utf-8'))
-                    bytes_total += len(new_xml)
-                else:
-                    # 流式拷贝，保留原 zinfo 的压缩方式/时间戳/扩展属性
-                    with in_zf.open(zinfo) as src, out_zf.open(zinfo, 'w') as dst:
-                        shutil.copyfileobj(src, dst)
-                    bytes_total += zinfo.file_size
-                if progress_cb:
-                    progress_cb(i, n_total, name, bytes_total)
-        os.replace(tmp_path, dst_path)
-    except Exception:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-        raise
 
 
 def _rebuild_one_story(
@@ -1821,8 +1750,9 @@ def generate_idml(
                     para_split_count += s_count
                     out_zf.writestr(zinfo, new_xml.encode('utf-8'))
                     if n_total > 10:
-                        print(f"\r  写回 {story_name} "
-                              f"{_progress_bar(i, n_total)}", end='', flush=True)
+                        _log_progress(
+                            f"\r  写回 {story_name} "
+                            f"{_progress_bar(i, n_total)}")
                     else:
                         print(f"  写回 [{i}/{n_total}] {story_name} "
                               f"(重建 {r_count} + 不变 {u_count} + 分割 {s_count})")
@@ -1830,8 +1760,9 @@ def generate_idml(
                     with in_zf.open(zinfo) as src, out_zf.open(zinfo, 'w') as dst:
                         shutil.copyfileobj(src, dst)
                 if n_total > 10 and i % 10 == 0:
-                    print(f"\r  写回 {name} "
-                          f"{_progress_bar(i, n_total)}", end='', flush=True)
+                    _log_progress(
+                        f"\r  写回 {name} "
+                        f"{_progress_bar(i, n_total)}")
         if n_total > 10:
             print()
         os.replace(tmp_path, output_path)
@@ -1842,6 +1773,14 @@ def generate_idml(
 
     print(f"  重建 {para_rebuilt_count} 个段落，{para_unchanged_count} 个段落保持不变，"
           f"{para_split_count} 个新段落（来自分割）")
+
+
+def _count_br(xml: str) -> int:
+    """统计 XML 中 Br 标签数量（<Br /> 与 <Br/> 两种写法）。
+
+    P3-9(#26): 原在 _verify_structure / _verify_br_count 中重复定义，提取为模块级。
+    """
+    return xml.count('<Br />') + xml.count('<Br/>')
 
 
 def _read_story_xmls(path: str) -> dict[str, str]:
@@ -1900,9 +1839,6 @@ def _verify_structure(
         )
 
     # ---- 2: Br 数量合理性 ----
-    def _count_br(xml: str) -> int:
-        return xml.count('<Br />') + xml.count('<Br/>')
-
     csr_pattern = (
         r'<CharacterStyleRange([^>]*?CharacterStyle/句号[^>]*?)>'
         r'.*?</CharacterStyleRange>'
@@ -2039,9 +1975,6 @@ def _verify_br_count(
 
     字符级输出验证（_verify_output）是真正的质量保证。
     """
-    def _count_br(xml: str) -> int:
-        return xml.count('<Br />') + xml.count('<Br/>')
-
     csr_pattern = r'<CharacterStyleRange([^>]*?CharacterStyle/句号[^>]*?)>.*?</CharacterStyleRange>'
 
     in_br_total = 0
@@ -2059,8 +1992,16 @@ def _verify_br_count(
 
     br_cleared_text = in_br_total - br_in_old_punct - out_br_total
 
-    print(f"  Br 统计: 输入 {in_br_total} → 输出 {out_br_total}"
-          f"（旧句号清除 {br_in_old_punct}, 清空文字 CSR 清除 {br_cleared_text}）")
+    # P3-4: br_cleared_text 为负时给出提示而非直接打印负数
+    #（输出 Br 多于「输入−旧句号清除」，常见于新增句号模板自带 Br，非错误）
+    if br_cleared_text < 0:
+        print(f"  Br 统计: 输入 {in_br_total} → 输出 {out_br_total}"
+              f"（旧句号清除 {br_in_old_punct}, 清空文字 CSR 清除 {br_cleared_text}）")
+        print(f"  [提示] 清除数为负：输出 Br 比预期多 {-br_cleared_text} 个，"
+              f"通常来自新增句号模板携带的 Br（属正常情况，非错误）")
+    else:
+        print(f"  Br 统计: 输入 {in_br_total} → 输出 {out_br_total}"
+              f"（旧句号清除 {br_in_old_punct}, 清空文字 CSR 清除 {br_cleared_text}）")
 
 
 def _verify_output(
@@ -2271,6 +2212,11 @@ def process(idml_path, result_path, output_path, min_clean_chars: int = 50):
                    preloaded_xmls=out_story_xmls,
                    expected_special=input_special,
                    min_clean_chars=min_clean_chars)
+
+    # P3-11: 汇总非法实体替换计数
+    if _REPLACEMENT_COUNT['replaced'] > 0:
+        print(f"\n[警告] 本次处理共 {_REPLACEMENT_COUNT['replaced']} 个非法"
+              f"HTML 实体被替换为 U+FFFD（请检查 IDML 来源是否正常）")
 
     print(f"\n{'=' * 60}")
     print(f"完成！输出文件: {output_path}")
