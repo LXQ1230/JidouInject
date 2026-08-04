@@ -18,6 +18,7 @@ import zipfile
 import unicodedata
 import ctypes
 import time
+import gc
 from dataclasses import dataclass
 
 
@@ -181,23 +182,43 @@ def _get_prev_non_ws_font(
     idml_clean_indices: list[int],
     all_idml_records: list[dict],
 ) -> str | None:
-    """从 idml_idx 往回找上一个非空白文字字符，返回其字体名。"""
+    """从 idml_idx 往回找上一个非空白文字字符，返回其字体名。
+
+    P2-3: 不跨 Story/段落边界——前一个记录与当前记录不同 story 或 para
+    时按 None 处理（视为无前字），避免跨边界取到装饰/相邻段落的字体，
+    造成错误的抑制判断。
+    """
+    if not (0 <= idml_idx < len(idml_clean_indices)):
+        return None
+    cur = all_idml_records[idml_clean_indices[idml_idx]]
     for j in range(idml_idx - 1, -1, -1):
         ti = idml_clean_indices[j]
         rec = all_idml_records[ti]
+        if (rec['story_idx'], rec['para_idx']) != (cur['story_idx'], cur['para_idx']):
+            return None  # 跨 Story/段落边界
         if not _is_ws_for_compare(rec['char']):
             return rec.get('font')
     return None
+
 
 def _get_next_non_ws_font(
     idml_idx: int,
     idml_clean_indices: list[int],
     all_idml_records: list[dict],
 ) -> str | None:
-    """从 idml_idx 向前找下一个非空白文字字符，返回其字体名。"""
+    """从 idml_idx 向前找下一个非空白文字字符，返回其字体名。
+
+    P2-3: 不跨 Story/段落边界——后一个记录与当前记录不同 story 或 para
+    时按 None 处理（视为无后字），避免跨边界取字体。
+    """
+    if not (0 <= idml_idx < len(idml_clean_indices)):
+        return None
+    cur = all_idml_records[idml_clean_indices[idml_idx]]
     for j in range(idml_idx, len(idml_clean_indices)):
         ti = idml_clean_indices[j]
         rec = all_idml_records[ti]
+        if (rec['story_idx'], rec['para_idx']) != (cur['story_idx'], cur['para_idx']):
+            return None  # 跨 Story/段落边界
         if not _is_ws_for_compare(rec['char']):
             return rec.get('font')
     return None
@@ -402,7 +423,16 @@ def main():
     parser.add_argument("--idml", required=True, help="原始 IDML 文件路径")
     parser.add_argument("--result", required=True, help="句读结果 MD 文件路径")
     parser.add_argument("--output", help="输出 IDML 路径（默认自动生成）")
+    parser.add_argument(
+        "--min-clean", type=int, default=50, dest="min_clean_chars",
+        help="正文 Story 判定阈值：净字符数低于此值的 Story 视为装饰性元素，"
+             "不参与对齐（默认 50）",
+    )
     args = parser.parse_args()
+
+    if args.min_clean_chars < 1:
+        print("错误: --min-clean 必须 >= 1")
+        sys.exit(1)
 
     # 输入文件存在性检查
     if not os.path.isfile(args.idml):
@@ -446,7 +476,8 @@ def main():
         args.output = resolved
 
     try:
-        process(args.idml, args.result, args.output)
+        process(args.idml, args.result, args.output,
+                min_clean_chars=args.min_clean_chars)
     except ValueError as e:
         print(f"\n处理失败: {e}")
         sys.exit(1)
@@ -808,9 +839,13 @@ def extract_from_result(md_path: str) -> dict:
     with open(md_path, 'r', encoding='utf-8-sig') as f:
         content = f.read()
 
-    # 跳过文件头（# 标题 到 第一个 --- 之间的内容）
-    parts = content.split('---', 1)
-    body = parts[1] if len(parts) > 1 else content
+    # P2-7: 跳过文件头 — 仅当文件以「# 标题\n\n---」三段式开头时
+    # （句读结果标准头），跳过标题与第一个 --- 之间的元数据。
+    # 正文中出现的 --- 不再截断（旧实现 split('---',1) 会误切正文）。
+    body = content
+    header_match = re.match(r'#[^\n]*\n\s*\n---\n', content)
+    if header_match:
+        body = content[header_match.end():]
 
     # 逐行处理，检测空行作为段落边界
     lines = body.replace('\r', '').split('\n')
@@ -840,7 +875,9 @@ def extract_from_result(md_path: str) -> dict:
     return {'chars': chars, 'para_breaks': para_breaks}
 
 
-def validate_and_align(stories: list[dict], result_data: dict) -> dict:
+def validate_and_align(
+    stories: list[dict], result_data: dict, min_clean_chars: int = 50
+) -> dict:
     """
     验证 IDML 净文字与句读结果净文字一致，然后执行字符级对齐。
 
@@ -851,6 +888,11 @@ def validate_and_align(stories: list[dict], result_data: dict) -> dict:
     - 句读结果中的空行（段落边界）会触发 IDML 段落分割：
       边界位置的字符及其后续内容分配到新的虚拟段落
 
+    Args:
+        min_clean_chars: 判定「正文 Story」的最小净字符数阈值（P2-8 参数化，
+            默认 50）。低于阈值的 Story 视为装饰性元素（页眉、译者信息等），
+            不参与对齐。
+
     返回: grouped_records，结构为 {story_idx: {para_idx: [records]}}
     """
     result_chars: list[str] = result_data['chars']
@@ -859,7 +901,6 @@ def validate_and_align(stories: list[dict], result_data: dict) -> dict:
     # 扁平化所有 IDML 字符记录
     # 跳过内容过少的故事（装饰性元素，如页眉标题、译者信息等）
     # 这些装饰故事的内容不在句读结果中，不应参与对齐
-    _MIN_CLEAN_CHARS_PER_STORY = 50
     all_idml_records: list[dict] = []
     for story in stories:
         # 检查此 story 是否有足够的正文内容
@@ -869,7 +910,7 @@ def validate_and_align(stories: list[dict], result_data: dict) -> dict:
             if not rec['is_punct'] and not rec.get('is_special', False)
             and not _is_unicode_whitespace(rec['char'])
         )
-        if story_clean_count < _MIN_CLEAN_CHARS_PER_STORY:
+        if story_clean_count < min_clean_chars:
             continue
         for para in story['paragraphs']:
             for rec in para['chars']:
@@ -1909,6 +1950,9 @@ def _verify_structure(
         )
 
     # ---- 3: 分割段落无 leading Br ----
+    # P2-5: 只检查 split_sources 指定的分割段落，而非遍历全部段落。
+    # 分割段落在输出中的 PSR 索引 = 原段落 (orig_pi+1) 个 + 前面
+    # orig_pi' < orig_pi 的同 Story 分割段落数（position = orig_pi+0.5 排序）。
     for (si, new_pi), orig_pi in split_sources.items():
         story_path = f'Stories/Story_{stories[si]["name"]}.xml'
         if story_path not in out_story_xmls:
@@ -1918,27 +1962,32 @@ def _verify_structure(
             r'<ParagraphStyleRange[^>]*>.*?</ParagraphStyleRange>',
             xml, re.DOTALL
         ))
-        # 找到这个分割段落（position = orig_pi + 0.5）
-        # 简化：遍历所有段落，找 leading Br
-        for i, psr in enumerate(psrs):
-            csrs = list(re.finditer(
-                r'<CharacterStyleRange([^>]*?)(?:>(.*?)</CharacterStyleRange>|/>)',
-                psr.group(0), re.DOTALL
-            ))
-            first_content = None
-            for j, m in enumerate(csrs):
-                inner = m.group(2) or ''
-                c = re.findall(r'<Content>(.*?)</Content>', inner, re.DOTALL)
-                if any(t.strip() for t in c):
-                    first_content = j
-                    break
-            if first_content is None:
-                continue
-            for j in range(first_content):
-                if '<Br' in csrs[j].group(0):
-                    errors.append(
-                        f"分割段落 Para[{i}] CSR[{j}] 存在 leading Br"
-                    )
+        splits_of_story = sorted(
+            (op, np) for (s, np), op in split_sources.items() if s == si
+        )
+        before_splits = sum(1 for op, _ in splits_of_story if op < orig_pi)
+        out_idx = orig_pi + 1 + before_splits
+        if out_idx >= len(psrs):
+            continue
+        psr = psrs[out_idx]
+        csrs = list(re.finditer(
+            r'<CharacterStyleRange([^>]*?)(?:>(.*?)</CharacterStyleRange>|/>)',
+            psr.group(0), re.DOTALL
+        ))
+        first_content = None
+        for j, m in enumerate(csrs):
+            inner = m.group(2) or ''
+            c = re.findall(r'<Content>(.*?)</Content>', inner, re.DOTALL)
+            if any(t.strip() for t in c):
+                first_content = j
+                break
+        if first_content is None:
+            continue
+        for j in range(first_content):
+            if '<Br' in csrs[j].group(0):
+                errors.append(
+                    f"分割段落 Para[{out_idx}] CSR[{j}] 存在 leading Br"
+                )
 
     # ---- 4: 段落数一致性（仅统计有注入操作的 Story） ----
     expected_paras = 0
@@ -2019,6 +2068,7 @@ def _verify_output(
     expected_chars: list[str],
     preloaded_xmls: dict[str, str] | None = None,
     expected_special: set[str] | None = None,
+    min_clean_chars: int = 50,
 ) -> None:
     """输出自检：从生成的 IDML 重新提取字符序列并与输入比对。
 
@@ -2029,6 +2079,7 @@ def _verify_output(
     避免全量解压扫描与 Story XML 二次驻留。
     expected_special: 输入 IDML 提取的 is_special 指令集合（如 <?ACE N?>）。
     传入时核对输出保留情况（FIX-6）。
+    min_clean_chars: 正文 Story 判定阈值（P2-8，与 validate_and_align 一致）。
     """
     # 重新提取（复用预加载的 Story XML，避免再次解压）
     stories = extract_from_idml(output_path, preloaded_xmls=preloaded_xmls)
@@ -2040,7 +2091,7 @@ def _verify_output(
             if not rec['is_punct'] and not rec.get('is_special', False)
             and not _is_unicode_whitespace(rec['char'])
         )
-        if story_clean < 50:
+        if story_clean < min_clean_chars:
             continue
         for para in story['paragraphs']:
             for rec in para['chars']:
@@ -2119,8 +2170,12 @@ def _verify_output(
     )
 
 
-def process(idml_path, result_path, output_path):
-    """主处理流程"""
+def process(idml_path, result_path, output_path, min_clean_chars: int = 50):
+    """主处理流程
+
+    Args:
+        min_clean_chars: 正文 Story 判定阈值（P2-8，默认 50）。
+    """
     t0 = time.time()
     print("=" * 60)
     print("IDML 句读结果回注工具")
@@ -2146,7 +2201,7 @@ def process(idml_path, result_path, output_path):
 
     # Step 3: 验证并对齐
     print("\n[3/5] 验证并对齐...")
-    alignment = validate_and_align(stories, result_data)
+    alignment = validate_and_align(stories, result_data, min_clean_chars)
     grouped_records = alignment['grouped']
     split_sources = alignment['split_sources']
 
@@ -2201,15 +2256,21 @@ def process(idml_path, result_path, output_path):
             if not rec['is_punct'] and not rec.get('is_special', False)
             and not _is_unicode_whitespace(rec['char'])
         )
-        if story_clean < 50:
+        if story_clean < min_clean_chars:
             continue
         for para in story['paragraphs']:
             for rec in para['chars']:
                 if rec.get('is_special', False):
                     input_special.add(rec['char'])
+    # P2-10: 释放 stories 大对象（大经书内存优化）。
+    # _verify_output 用 preloaded_xmls 重新提取，不依赖 stories；
+    # input_special / verify_expected 已提前计算。
+    del stories
+    gc.collect()
     _verify_output(output_path, verify_expected,
                    preloaded_xmls=out_story_xmls,
-                   expected_special=input_special)
+                   expected_special=input_special,
+                   min_clean_chars=min_clean_chars)
 
     print(f"\n{'=' * 60}")
     print(f"完成！输出文件: {output_path}")
@@ -2218,4 +2279,11 @@ def process(idml_path, result_path, output_path):
 
 
 if __name__ == "__main__":
+    # P2-1: 强制 UTF-8 输出，避免 Windows 控制台 GBK 编码错误
+    # （与 inject.bat 的 -X utf8 双保险）
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
     main()

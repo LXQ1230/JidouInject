@@ -92,18 +92,31 @@ def find_pairs():
         idml_list = idml_by_number[num]
         md_list = md_by_number.get(num, [])
 
+        # P2-2: 同经号多文件时按优先级选择，而非固定取第一个：
+        #   IDML：含「导出」优先；句读结果：含「句读结果」优先
+        #   剩余按文件名排序取第一个（确定性）
         if len(idml_list) > 1:
-            print(f"警告: 经号 {num} 有多个 IDML 文件 ({idml_list})，使用第一个: {idml_list[0]}")
+            pref = [f for f in idml_list if "导出" in f]
+            idml_chosen = (pref or sorted(idml_list))[0]
+            print(f"警告: 经号 {num} 有多个 IDML 文件 ({idml_list})，"
+                  f"优先选择: {idml_chosen}")
+        else:
+            idml_chosen = idml_list[0]
         if len(md_list) > 1:
-            print(f"警告: 经号 {num} 有多个句读结果 ({md_list})，使用第一个: {md_list[0]}")
+            pref = [f for f in md_list if "句读结果" in f]
+            md_chosen = (pref or sorted(md_list))[0]
+            print(f"警告: 经号 {num} 有多个句读结果 ({md_list})，"
+                  f"优先选择: {md_chosen}")
+        else:
+            md_chosen = md_list[0]
 
         if not md_list:
-            print(f"警告: 经号 {num} ({idml_list[0]}) 找不到对应句读结果，跳过")
+            print(f"警告: 经号 {num} ({idml_chosen}) 找不到对应句读结果，跳过")
             continue
 
         pairs.append((
-            os.path.join(PENDING_DIR, idml_list[0]),
-            os.path.join(PENDING_DIR, md_list[0]),
+            os.path.join(PENDING_DIR, idml_chosen),
+            os.path.join(PENDING_DIR, md_chosen),
             num,
         ))
 

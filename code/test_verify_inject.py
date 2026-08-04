@@ -46,8 +46,10 @@ def test_275():
 
     # ---- 检查 1: 原文文字零改动 ----
     print("\n[1] 原文文字零改动检查...")
-    orig_chars = _extract_clean_chars(idml_path)
-    out_chars = _extract_clean_chars(output_path)
+    # P2-4: 动态定位主 Story（不硬编码 Story_u15de.xml）
+    story_path = _find_main_story_path(idml_path)
+    orig_chars = _extract_clean_chars(idml_path, story_path)
+    out_chars = _extract_clean_chars(output_path, story_path)
     assert orig_chars == out_chars, (
         f"文字改动！原始 {len(orig_chars)} 字 vs 输出 {len(out_chars)} 字"
     )
@@ -55,14 +57,15 @@ def test_275():
 
     # ---- 检查 2: Group Self ID 无重复 ----
     print("\n[2] Group Self ID 重复检查...")
-    group_ids = _collect_group_ids(output_path)
+    group_ids = _collect_group_ids(output_path, story_path)
     duplicates = {gid: count for gid, count in group_ids.items() if count > 1}
     assert not duplicates, f"发现重复 Group ID: {duplicates}"
     print(f"    ✓ {len(group_ids)} 个 Group ID 全部唯一")
 
     # ---- 检查 3: 分割副本段落无 leading Br ----
     print("\n[3] 分割段落 leading Br 检查...")
-    split_leading_br = _check_split_leading_br(output_path, alignment['split_sources'])
+    split_leading_br = _check_split_leading_br(
+        output_path, alignment['split_sources'], story_path)
     assert not split_leading_br, (
         f"分割段落存在 leading Br: {split_leading_br}"
     )
@@ -70,7 +73,7 @@ def test_275():
 
     # ---- 检查 4: 关键段落间空行 ----
     print("\n[4] 关键段落间空行检查...")
-    para_bounds = _check_key_boundaries(output_path)
+    para_bounds = _check_key_boundaries(output_path, story_path)
     for check_name, result in para_bounds.items():
         status = "✓" if result["ok"] else "✗"
         print(f"    {status} {check_name}: {result['detail']}")
@@ -104,13 +107,37 @@ def test_275():
     print("全部检查通过 ✓")
     print(f"{'=' * 60}")
 
-def _extract_clean_chars(path: str) -> list[str]:
-    """提取 IDML 中所有非标点、非比对空白的文字。
+def _find_main_story_path(idml_path: str) -> str:
+    """从 IDML 动态定位主 Story 路径（净文字最多的正文 Story）。
+
+    P2-4: 替代硬编码 Stories/Story_u15de.xml——换 InDesign 版本或文件名后
+    Story 名会变，硬编码会静默读取错误 Story 甚至 KeyError。
+    """
+    stories = extract_from_idml(idml_path)
+    best_name, best_count = None, -1
+    for story in stories:
+        count = sum(
+            1 for para in story['paragraphs']
+            for rec in para['chars']
+            if not rec['is_punct'] and not rec.get('is_special', False)
+            and not _is_unicode_whitespace(rec['char'])
+        )
+        if count > best_count:
+            best_name, best_count = story['name'], count
+    if best_name is None:
+        raise RuntimeError(f"无法定位主 Story: {idml_path}")
+    return f"Stories/Story_{best_name}.xml"
+
+
+def _extract_clean_chars(path: str, story_path: str | None = None) -> list[str]:
+    """提取 IDML 主 Story 中所有非标点、非比对空白的文字。
 
     使用 _is_ws_for_compare（含 U+3000）与 validate_and_align 的比对逻辑一致。
     """
+    if story_path is None:
+        story_path = _find_main_story_path(path)
     with zipfile.ZipFile(path, 'r') as zf:
-        xml = zf.read('Stories/Story_u15de.xml').decode('utf-8')
+        xml = zf.read(story_path).decode('utf-8')
     all_contents = re.findall(r'<Content>(.*?)</Content>', xml, re.DOTALL)
     full = re.sub(r'<\?.*?\?>', '', ''.join(all_contents))
     return [ch for ch in full
@@ -118,10 +145,12 @@ def _extract_clean_chars(path: str) -> list[str]:
             and not _is_old_punct(ch)]
 
 
-def _collect_group_ids(path: str) -> dict[str, int]:
-    """统计所有 Group Self ID 出现次数"""
+def _collect_group_ids(path: str, story_path: str | None = None) -> dict[str, int]:
+    """统计主 Story 中所有 Group Self ID 出现次数"""
+    if story_path is None:
+        story_path = _find_main_story_path(path)
     with zipfile.ZipFile(path, 'r') as zf:
-        xml = zf.read('Stories/Story_u15de.xml').decode('utf-8')
+        xml = zf.read(story_path).decode('utf-8')
     ids = re.findall(r'Self="([^"]+)"', xml)
     counts = {}
     for gid in ids:
@@ -129,11 +158,15 @@ def _collect_group_ids(path: str) -> dict[str, int]:
     return counts
 
 
-def _check_split_leading_br(output_path: str, split_sources: dict) -> list[str]:
+def _check_split_leading_br(
+    output_path: str, split_sources: dict, story_path: str | None = None
+) -> list[str]:
     """检查分割副本段落是否有 leading Br"""
     issues = []
+    if story_path is None:
+        story_path = _find_main_story_path(output_path)
     with zipfile.ZipFile(output_path, 'r') as zf:
-        xml = zf.read('Stories/Story_u15de.xml').decode('utf-8')
+        xml = zf.read(story_path).decode('utf-8')
 
     psrs = list(re.finditer(
         r'<ParagraphStyleRange[^>]*>.*?</ParagraphStyleRange>', xml, re.DOTALL
@@ -167,10 +200,12 @@ def _check_split_leading_br(output_path: str, split_sources: dict) -> list[str]:
     return issues
 
 
-def _check_key_boundaries(output_path: str) -> dict:
+def _check_key_boundaries(output_path: str, story_path: str | None = None) -> dict:
     """检查 275 关键段落边界"""
+    if story_path is None:
+        story_path = _find_main_story_path(output_path)
     with zipfile.ZipFile(output_path, 'r') as zf:
-        xml = zf.read('Stories/Story_u15de.xml').decode('utf-8')
+        xml = zf.read(story_path).decode('utf-8')
 
     psrs = list(re.finditer(
         r'<ParagraphStyleRange[^>]*>.*?</ParagraphStyleRange>', xml, re.DOTALL
@@ -266,8 +301,10 @@ def test_461():
 
     # 检查 1: 原文零改动
     print("\n[1] 原文文字零改动检查...")
-    orig_chars = _extract_clean_chars(idml_path)
-    out_chars = _extract_clean_chars(output_path)
+    # P2-4: 动态定位主 Story（不硬编码 Story_u15de.xml）
+    story_path = _find_main_story_path(idml_path)
+    orig_chars = _extract_clean_chars(idml_path, story_path)
+    out_chars = _extract_clean_chars(output_path, story_path)
     assert orig_chars == out_chars, (
         f"文字改动！原始 {len(orig_chars)} 字 vs 输出 {len(out_chars)} 字"
     )
@@ -275,14 +312,15 @@ def test_461():
 
     # 检查 2: Group ID 无重复
     print("\n[2] Group Self ID 重复检查...")
-    group_ids = _collect_group_ids(output_path)
+    group_ids = _collect_group_ids(output_path, story_path)
     duplicates = {gid: count for gid, count in group_ids.items() if count > 1}
     assert not duplicates, f"发现重复 Group ID: {duplicates}"
     print(f"    ✓ {len(group_ids)} 个 Group ID 全部唯一")
 
     # 检查 3: 分割副本段落无 leading Br
     print("\n[3] 分割段落 leading Br 检查...")
-    split_issues = _check_split_leading_br(output_path, alignment['split_sources'])
+    split_issues = _check_split_leading_br(
+        output_path, alignment['split_sources'], story_path)
     assert not split_issues, f"分割段落存在 leading Br: {split_issues}"
     print(f"    ✓ {len(alignment['split_sources'])} 个分割段落无 leading Br")
 
