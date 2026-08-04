@@ -426,6 +426,11 @@ def main():
         base = os.path.splitext(args.idml)[0]
         args.output = f"{base}_WD注入.idml"
 
+    # FIX-7: --output 不能与 --idml 同路径（会覆盖源文件）
+    if os.path.abspath(args.output) == os.path.abspath(args.idml):
+        print("错误: --output 不能与 --idml 同路径（会覆盖源文件）")
+        sys.exit(1)
+
     print(f"输入 IDML: {args.idml}")
     print(f"句读结果: {args.result}")
     print(f"输出文件: {args.output}")
@@ -1183,6 +1188,32 @@ def _rebuild_paragraph_xml(
                 not c.strip() for c in cdata.get('contents', [])
             )
 
+            # FIX-6: 正文 Story 内嵌 ACE 加工指令（<?ACE N?>）——
+            # 这类 Content 是 InDesign 字形替换指令，清空会破坏正文渲染。
+            # 含 ACE 的 CSR 保留其 ACE Content，Br/Group 仍按原规则处理。
+            orig_had_ace = '<?ACE' in orig_csr
+            if orig_had_ace:
+                def _ace(keep_br):
+                    return _clear_content_preserve_ace(
+                        orig_csr, keep_br=keep_br,
+                        strip_groups=is_split_copy)
+                if is_punct:
+                    if has_br and is_trailing and orig_all_ws:
+                        csr_replacements[ci] = _ace(True)
+                    else:
+                        csr_replacements[ci] = _ace(False)
+                elif is_close_trailing and not orig_had_text:
+                    csr_replacements[ci] = _ace(True)
+                elif is_split_copy:
+                    csr_replacements[ci] = _clear_content_preserve_ace(
+                        orig_csr, keep_br=False, strip_groups=True)
+                elif not is_leading and not is_trailing \
+                        and has_br and orig_all_ws:
+                    csr_replacements[ci] = _ace(True)
+                else:
+                    csr_replacements[ci] = _ace(False)
+                continue
+
             if is_punct:
                 # A1: 尾随 punct 分隔符（原始纯空白内容）→ 保留 Br
                 if has_br and is_trailing and orig_all_ws:
@@ -1272,6 +1303,11 @@ def _rebuild_paragraph_xml(
 
             if total_orig > 0:
                 parts_xml = csr_xml
+                # FIX-5: 按索引定位替换而非 str.replace(old, new, 1)。
+                # 多个相同 Content 文本（如多个空 <Content></Content>）时，
+                # replace 顺序替换会错位（把前一个槽位的内容写入后一个）。
+                # 用 cursor 从上次替换位置继续搜索，保证一一对应。
+                cursor = 0
                 for oi, ol in enumerate(orig_lens):
                     part_text = text_by_slot.get(oi, '')
                     # 句号按 after_pos 在 slot 内部插入（隐患 2 修复）：
@@ -1287,7 +1323,14 @@ def _rebuild_paragraph_xml(
                             part_text += ptext
                     old_ctag = f'<Content>{orig_contents[oi]}</Content>'
                     new_ctag = f'<Content>{_xml_escape(part_text)}</Content>'
-                    parts_xml = parts_xml.replace(old_ctag, new_ctag, 1)
+                    pos = parts_xml.find(old_ctag, cursor)
+                    if pos < 0:
+                        raise ValueError(
+                            f"重建失败：Content 槽位 {oi} 未找到"
+                            f"（多 Content 定位替换失效）")
+                    parts_xml = (parts_xml[:pos] + new_ctag
+                                 + parts_xml[pos + len(old_ctag):])
+                    cursor = pos + len(new_ctag)
                 if is_split_copy:
                     parts_xml = re.sub(r'<Br\s*/>', '', parts_xml)
                 csr_replacements[ci] = parts_xml
@@ -1315,6 +1358,9 @@ def _rebuild_paragraph_xml(
             clean_prefix = re.sub(
                 r'<Group[^>]*>.*?</Group>', '', clean_prefix, flags=re.DOTALL
             )
+            # FIX-4: 拆分副本非首段剥离 Self 属性（仅首段保留原 Self，
+            # 中间/句号段复用会导致同一 Self ID 出现在多个 CSR 中）
+            clean_prefix = re.sub(r'Self="[^"]*"', '', clean_prefix)
             clean_suffix = csr_xml[csr_xml.rfind('</CharacterStyleRange>'):]
             non_punct_parts = [i for i, (is_p, _, _, _) in enumerate(segments)
                                if not is_p]
@@ -1493,6 +1539,33 @@ def _clear_content_strip_br(csr_xml: str, strip_groups: bool = False) -> str:
     result = re.sub(
         r'<Content>.*?</Content>',
         '<Content></Content>',
+        result,
+        flags=re.DOTALL,
+    )
+    return result
+
+
+def _clear_content_preserve_ace(
+    csr_xml: str, keep_br: bool, strip_groups: bool = False
+) -> str:
+    """清空非 ACE 的 Content，保留含 <?ACE 加工指令的 Content 文本。
+
+    InDesign 的 `<?ACE N?>` 是字形替换加工指令（如连字/异形字替换），
+    位于正文 Story 中时清空会破坏正文渲染。此函数用于无记录 CSR 的清理：
+    ACE Content 原样保留，其余 Content 清空为空壳。
+
+    Args:
+        keep_br: True 保留 Br（A1/A2/A3.5 语义），False 剥离（A3/A4 语义）。
+        strip_groups: 是否剥离 Group 元素（分割副本需 True 防重复 Self ID）。
+    """
+    result = csr_xml
+    if not keep_br:
+        result = re.sub(r'<Br\s*/>', '', result)
+    if strip_groups:
+        result = re.sub(r'<Group[^>]*>.*?</Group>', '', result, flags=re.DOTALL)
+    result = re.sub(
+        r'<Content>.*?</Content>',
+        lambda m: m.group(0) if '<?ACE' in m.group(0) else '<Content></Content>',
         result,
         flags=re.DOTALL,
     )
@@ -1780,7 +1853,10 @@ def _verify_structure(
         details = ', '.join(
             f'{gid}(×{len(s)})' for gid, s in dup_groups.items()
         )
-        errors.append(f"Group Self ID 重复: {details}")
+        errors.append(
+            f"Group Self ID 重复: {details}"
+            f"（可能由拆分复制未剥离 Self/Group 导致）"
+        )
 
     # ---- 2: Br 数量合理性 ----
     def _count_br(xml: str) -> int:
@@ -1942,6 +2018,7 @@ def _verify_output(
     output_path: str,
     expected_chars: list[str],
     preloaded_xmls: dict[str, str] | None = None,
+    expected_special: set[str] | None = None,
 ) -> None:
     """输出自检：从生成的 IDML 重新提取字符序列并与输入比对。
 
@@ -1950,6 +2027,8 @@ def _verify_output(
 
     参数: preloaded_xmls 由 _read_story_xmls 预加载共享，
     避免全量解压扫描与 Story XML 二次驻留。
+    expected_special: 输入 IDML 提取的 is_special 指令集合（如 <?ACE N?>）。
+    传入时核对输出保留情况（FIX-6）。
     """
     # 重新提取（复用预加载的 Story XML，避免再次解压）
     stories = extract_from_idml(output_path, preloaded_xmls=preloaded_xmls)
@@ -1971,8 +2050,13 @@ def _verify_output(
     # - 跳过 Unicode 空白（_is_unicode_whitespace）
     # - 保留 U+3000（它在 _is_unicode_whitespace 中返回 False）
     # - 保留所有可见字符和句号
+    # FIX-6: is_special 指令（ACE 等）单独收集核对，不混入正文字符序列
     output_chars: list[str] = []
+    output_special: set[str] = set()
     for rec in all_records:
+        if rec.get('is_special', False):
+            output_special.add(rec['char'])
+            continue
         ch = rec['char']
         if _is_unicode_whitespace(ch):
             continue
@@ -1985,6 +2069,23 @@ def _verify_output(
     ]
     expected_str = ''.join(expected_filtered)
     output_str = ''.join(output_chars)
+
+    # FIX-6: is_special 指令集合核对（输入输出一致）。
+    # 若输入正文含 ACE 指令而输出丢失，立即报错，防止静默破坏正文渲染。
+    if expected_special is not None and output_special != expected_special:
+        missing = sorted(expected_special - output_special)
+        extra = sorted(output_special - expected_special)
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
+        raise ValueError(
+            f"输出 IDML 验证失败！is_special 指令集合不一致"
+            f"（输出文件已删除: {output_path}）\n"
+            f"  输入有但输出丢失: {missing}\n"
+            f"  输出有但输入没有: {extra}\n"
+            f"这通常意味着正文 Story 内嵌的 ACE 等加工指令在重建时被清空。"
+        )
 
     if output_str == expected_str:
         print(f"  输出验证通过: {len(output_str)} 个字符与输入完全一致")
@@ -2088,8 +2189,27 @@ def process(idml_path, result_path, output_path):
             for r in recs2:
                 if not _is_unicode_whitespace(r['char']):
                     verify_expected.append(r['char'])
+    # FIX-6: 输入 is_special 指令集合（如 <?ACE N?>），供输出核对保留情况。
+    # 注意：与 _verify_output 采用相同过滤（仅统计正文 Story，clean>=50）——
+    # 装饰 Story（<50）不参与重建，其 XML 原样流式拷贝，ACE 天然保留；
+    # 若此处收集全部 Story，会与输出侧（仅正文）不一致造成误报。
+    input_special: set[str] = set()
+    for story in stories:
+        story_clean = sum(
+            1 for para in story['paragraphs']
+            for rec in para['chars']
+            if not rec['is_punct'] and not rec.get('is_special', False)
+            and not _is_unicode_whitespace(rec['char'])
+        )
+        if story_clean < 50:
+            continue
+        for para in story['paragraphs']:
+            for rec in para['chars']:
+                if rec.get('is_special', False):
+                    input_special.add(rec['char'])
     _verify_output(output_path, verify_expected,
-                   preloaded_xmls=out_story_xmls)
+                   preloaded_xmls=out_story_xmls,
+                   expected_special=input_special)
 
     print(f"\n{'=' * 60}")
     print(f"完成！输出文件: {output_path}")
