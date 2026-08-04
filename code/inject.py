@@ -16,6 +16,40 @@ import argparse
 import shutil
 import zipfile
 import unicodedata
+import ctypes
+import time
+from dataclasses import dataclass
+
+
+@dataclass(slots=True)
+class CharRecord:
+    """字符记录 — 紧凑结构（slots dataclass，约 90-120B/条，dict 约 250-300B/条）。
+
+    兼容 dict 读取接口（rec['char'] / rec.get('char', default)），
+    字段与旧 dict 字面量完全同名，所有读取点无需改动。
+    """
+    char: str
+    is_punct: bool
+    is_special: bool
+    story_idx: int
+    para_idx: int
+    csr_idx: int
+    content_slot: int
+    font: str | None = None       # 解析阶段有；对齐阶段记录无
+    after_csr: int = -1           # 仅对齐阶段句号记录使用
+    after_slot: int | None = None # 仅对齐阶段句号记录使用
+    slot_pos: int = 0             # 字符在 content_slot 内的偏移（解析阶段）
+    after_pos: int | None = None  # 句号跟随字符的 slot 内偏移（对齐阶段）
+
+    def __getitem__(self, key: str):
+        try:
+            return getattr(self, key)
+        except AttributeError:
+            raise KeyError(key)
+
+    def get(self, key: str, default=None):
+        return getattr(self, key, default)
+
 
 # 旧标点字符集 — 在句读处理前需从原文中清除的所有标点
 _OLD_PUNCT_CHARS: set[str] = {
@@ -225,7 +259,7 @@ def _should_suppress_punct(
     if next_rec is None:
         return False
 
-    prev_si, prev_pi, prev_ci, prev_sl = last_slot
+    prev_si, prev_pi, prev_ci, prev_sl, _prev_pos = last_slot
 
     # 同 CSR？
     if next_rec['csr_idx'] != prev_ci:
@@ -418,9 +452,67 @@ def main():
         sys.exit(1)
 
 
-def extract_from_idml(idml_path: str) -> list[dict]:
+def _get_memory_info() -> dict:
+    """读取进程峰值内存与系统可用内存（Windows，失败返回空 dict）。
+
+    使用标准库 ctypes 调用 psapi/kernel32，不引入第三方依赖。
     """
-    从 IDML 中提取所有文字及其样式信息。
+    try:
+        psapi = ctypes.WinDLL("psapi.dll")
+        kernel32 = ctypes.WinDLL("kernel32.dll")
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        psapi.GetProcessMemoryInfo.argtypes = (
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong)
+        pmc = PROCESS_MEMORY_COUNTERS()
+        pmc.cb = ctypes.sizeof(pmc)
+        handle = kernel32.GetCurrentProcess()
+        psapi.GetProcessMemoryInfo(handle, ctypes.byref(pmc), pmc.cb)
+        return {
+            'peak_rss_mb': pmc.PeakWorkingSetSize / 1024 / 1024,
+            'rss_mb': pmc.WorkingSetSize / 1024 / 1024,
+        }
+    except Exception:
+        return {}
+
+
+def _progress_bar(done: int, total: int, width: int = 40) -> str:
+    """生成 \r 进度条字符串（纯标准库）"""
+    if total <= 0:
+        return ""
+    pct = done / total
+    filled = int(width * pct)
+    bar = '█' * filled + '─' * (width - filled)
+    return f"[{bar}] {pct * 100:5.1f}% ({done}/{total})"
+
+
+def _mem_suffix() -> str:
+    """当前内存占用后缀（失败时为空串）"""
+    info = _get_memory_info()
+    if not info:
+        return ""
+    return f"  内存峰值 {info['peak_rss_mb']:.0f} MB / 当前 {info['rss_mb']:.0f} MB"
+
+
+class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+    _fields_ = [
+        ("cb", ctypes.c_ulong),
+        ("PageFaultCount", ctypes.c_ulong),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+    ]
+
+
+def extract_from_idml(
+    idml_path: str,
+    preloaded_xmls: dict[str, str] | None = None,
+) -> list[dict]:
+    """    从 IDML 中提取所有文字及其样式信息。
 
     返回: stories — 列表，每个元素是一个 story 的信息字典:
           {
@@ -455,13 +547,24 @@ def extract_from_idml(idml_path: str) -> list[dict]:
         story_order = _parse_story_order(designmap)
 
         # 读取每个 Story XML
-        for story_idx, story_name in enumerate(story_order):
+        # 注意：designmap 的 StoryList 可能含文件缺失的 story（如 3093 的 ub3），
+        # 若用 enumerate 序号作为 story_idx 会带空洞，导致 grouped/split_sources
+        # 的 key 与 stories 列表索引错位（隐患：stories[story_idx] 越界被静默跳过重建）。
+        # 因此 story_idx 取 stories 列表的实际索引（无空洞），保证全局一致性。
+        n_order = len(story_order)
+        for story_name in story_order:
             story_path = f'Stories/Story_{story_name}.xml'
             if story_path not in zf.namelist():
                 continue
 
-            story_xml = zf.read(story_path).decode('utf-8')
-            raw_story_xmls[story_name] = story_xml
+            if preloaded_xmls is not None and story_path in preloaded_xmls:
+                # 已预加载（验证阶段复用同一份内存 dict，免二次解压与驻留）
+                story_xml = preloaded_xmls[story_path]
+                raw_story_xmls[story_name] = story_xml
+            else:
+                story_xml = zf.read(story_path).decode('utf-8')
+                raw_story_xmls[story_name] = story_xml
+            story_idx = len(stories)
             paragraphs = _parse_story_xml(story_xml, story_idx)
             stories.append({
                 'name': story_name,
@@ -470,6 +573,13 @@ def extract_from_idml(idml_path: str) -> list[dict]:
                 'xml_footer': _get_story_footer(story_xml),
                 'paragraphs': paragraphs,
             })
+            if n_order > 10:
+                # 大文件：逐 Story 显示解析进度
+                print(f"\r  解析 Story [{story_idx + 1}/{n_order}] "
+                      f"{story_name}  {_progress_bar(story_idx + 1, n_order)}",
+                      end='', flush=True)
+        if n_order > 10:
+            print()
 
     # 自检：直接用正则从原始 XML 提取全部 Content 文本，
     # 与解析器提取结果比对，确保没有任何字符被漏掉
@@ -622,29 +732,30 @@ def _parse_paragraph_style_range(
 
             # 特殊加工指令（如 <?ACE 18?>）
             if re.match(r'<\?ACE\s', content_text):
-                chars.append({
-                    'char': content_text,
-                    'is_punct': False,
-                    'is_special': True,
-                    'story_idx': story_idx,
-                    'para_idx': para_idx,
-                    'csr_idx': csr_idx,
-                    'content_slot': slot_idx,
-                    'font': font,
-                })
+                chars.append(CharRecord(
+                    char=content_text,
+                    is_punct=False,
+                    is_special=True,
+                    story_idx=story_idx,
+                    para_idx=para_idx,
+                    csr_idx=csr_idx,
+                    content_slot=slot_idx,
+                    font=font,
+                ))
                 continue
 
-            for ch in content_text:
-                chars.append({
-                    'char': ch,
-                    'is_punct': _is_old_punct(ch),
-                    'is_special': False,
-                    'story_idx': story_idx,
-                    'para_idx': para_idx,
-                    'csr_idx': csr_idx,
-                    'content_slot': slot_idx,
-                    'font': font,
-                })
+            for pos, ch in enumerate(content_text):
+                chars.append(CharRecord(
+                    char=sys.intern(ch),
+                    is_punct=_is_old_punct(ch),
+                    is_special=False,
+                    story_idx=story_idx,
+                    para_idx=para_idx,
+                    csr_idx=csr_idx,
+                    content_slot=slot_idx,
+                    font=font,
+                    slot_pos=pos,
+                ))
 
         csr_idx += 1
 
@@ -851,19 +962,20 @@ def validate_and_align(stories: list[dict], result_data: dict) -> dict:
                 # IDML 原文的 U+3000 作为 IDML 记录保留在输出中，对齐循环继续
                 pass
             else:
-                si, pi, ci, sl = last_slot if last_slot else (0, 0, 0, 0)
+                si, pi, ci, sl, pos = last_slot if last_slot else (0, 0, 0, 0, 0)
                 effective_pi = current_effective.get((si, pi), pi)
-                new_records.append({
-                    'char': '。',
-                    'is_punct': True,
-                    'is_special': False,
-                    'story_idx': si,
-                    'para_idx': effective_pi,
-                    'csr_idx': -1,
-                    'content_slot': -1,
-                    'after_csr': ci,
-                    'after_slot': sl,
-                })
+                new_records.append(CharRecord(
+                    char='。',
+                    is_punct=True,
+                    is_special=False,
+                    story_idx=si,
+                    para_idx=effective_pi,
+                    csr_idx=-1,
+                    content_slot=-1,
+                    after_csr=ci,
+                    after_slot=sl,
+                    after_pos=pos,
+                ))
         elif _is_ws_for_compare(ch):
             pass
         else:
@@ -877,28 +989,30 @@ def validate_and_align(stories: list[dict], result_data: dict) -> dict:
                 )
                 if _is_ws_for_compare(orig_rec['char']):
                     last_slot = (orig_rec['story_idx'], orig_rec['para_idx'],
-                                 orig_rec['csr_idx'], orig_rec['content_slot'])
-                    new_records.append({
-                        'char': orig_rec['char'],
-                        'is_punct': False,
-                        'is_special': False,
-                        'story_idx': orig_rec['story_idx'],
-                        'para_idx': effective_pi,
-                        'csr_idx': orig_rec['csr_idx'],
-                        'content_slot': orig_rec['content_slot'],
-                    })
+                                 orig_rec['csr_idx'], orig_rec['content_slot'],
+                                 orig_rec.get('slot_pos', 0))
+                    new_records.append(CharRecord(
+                        char=orig_rec['char'],
+                        is_punct=False,
+                        is_special=False,
+                        story_idx=orig_rec['story_idx'],
+                        para_idx=effective_pi,
+                        csr_idx=orig_rec['csr_idx'],
+                        content_slot=orig_rec['content_slot'],
+                    ))
                 else:
                     last_slot = (orig_rec['story_idx'], orig_rec['para_idx'],
-                                 orig_rec['csr_idx'], orig_rec['content_slot'])
-                    new_records.append({
-                        'char': orig_rec['char'],
-                        'is_punct': False,
-                        'is_special': False,
-                        'story_idx': orig_rec['story_idx'],
-                        'para_idx': effective_pi,
-                        'csr_idx': orig_rec['csr_idx'],
-                        'content_slot': orig_rec['content_slot'],
-                    })
+                                 orig_rec['csr_idx'], orig_rec['content_slot'],
+                                 orig_rec.get('slot_pos', 0))
+                    new_records.append(CharRecord(
+                        char=orig_rec['char'],
+                        is_punct=False,
+                        is_special=False,
+                        story_idx=orig_rec['story_idx'],
+                        para_idx=effective_pi,
+                        csr_idx=orig_rec['csr_idx'],
+                        content_slot=orig_rec['content_slot'],
+                    ))
                     break
 
     # 按 (story_idx, para_idx) 分组
@@ -987,9 +1101,10 @@ def _rebuild_paragraph_xml(
 
     # 3. 将记录按 csr_idx 分组（含句号：after_csr 指向它跟随的文字 CSR）
     # csr_segments: {csr_idx: [(is_punct, text, after_slot|null), ...]}
-    # 对于文字: csr_idx = rec['csr_idx']
-    # 对于句号: csr_idx = rec['after_csr'], after_slot = rec.get('after_slot')
-    csr_segments: dict[int, list[tuple[bool, str, int | None]]] = {}
+    # 对于文字: csr_idx = rec['csr_idx'], pos = rec['slot_pos']
+    # 对于句号: csr_idx = rec['after_csr'], after_slot = rec['after_slot'],
+    #           pos = rec['after_pos']（跟随字符的 slot 内偏移，支持槽内插句号）
+    csr_segments: dict[int, list[tuple[bool, str, int | None, int | None]]] = {}
     for rec in all_records:
         if rec.get('is_punct', False):
             ci = rec.get('after_csr', -1)
@@ -1000,14 +1115,17 @@ def _rebuild_paragraph_xml(
         is_p = rec.get('is_punct', False)
         if is_p:
             slot = rec.get('after_slot')
+            pos = rec.get('after_pos')
         else:
             slot = rec.get('content_slot')
-        csr_segments.setdefault(ci, []).append((is_p, rec['char'], slot))
+            pos = rec.get('slot_pos', 0)
+        csr_segments.setdefault(ci, []).append((is_p, rec['char'], slot, pos))
 
     # 3.5 确定文字内容 CSR 的范围（用于区分 leading/trailing 清除区域）
     text_content_csrs = {
         ci for ci, segs in csr_segments.items()
-        if any(not is_p for is_p, _, _ in segs) and not csr_list[ci]['is_punct']
+        if any(not is_p for is_p, _, _, _ in segs)
+        and not csr_list[ci]['is_punct']
     }
     min_text_idx = min(text_content_csrs) if text_content_csrs else 0
     max_text_idx = max(text_content_csrs) if text_content_csrs else len(csr_list) - 1
@@ -1086,8 +1204,9 @@ def _rebuild_paragraph_xml(
             # 旧句号 CSR：保留原 CSR 中的 Br，Content 用模板替换
             orig_csr = cdata['match'].group(0)
             has_br = '<Br' in orig_csr
-            punct_segments = [t for is_p, t, _ in segments if is_p]
-            text_segments = [(is_p, t, slot) for is_p, t, slot in segments if not is_p]
+            punct_segments = [t for is_p, t, _, _ in segments if is_p]
+            text_segments = [(is_p, t, slot) for is_p, t, slot, _ in segments
+                             if not is_p]
             if text_segments:
                 # CSR 带有句号样式但包含非标点内容（如 U+3000 全角空格
                 # 因排版需要被赋予了 CharacterStyle/句号样式）。
@@ -1121,20 +1240,22 @@ def _rebuild_paragraph_xml(
 
         orig_contents = cdata.get('contents', [])
         is_multi_content = len(orig_contents) > 1
-        has_punct_inside = any(p for p, _, _ in segments)
+        has_punct_inside = any(p for p, _, _, _ in segments)
 
         if is_multi_content:
             # 多 Content CSR：文字按实际 content_slot 分组，标点按 after_slot 分配
             orig_lens = [len(c) for c in orig_contents]
             total_orig = sum(orig_lens)
 
-            # 文字按实际 slot 分组，标点按 after_slot 归属到对应 Content 槽位
+            # 文字按实际 slot 分组，标点按 after_slot 归属到对应 Content 槽位；
+            # 句号携带 after_pos（跟随字符的 slot 内偏移），支持槽内插入
             text_by_slot: dict[int, str] = {}
-            punct_by_slot: dict[int, list[str]] = {}
-            for is_p, text, slot in segments:
+            punct_by_slot: dict[int, list[tuple[int, str]]] = {}
+            for is_p, text, slot, pos in segments:
                 if is_p:
                     sl = slot if slot is not None else 0
-                    punct_by_slot.setdefault(sl, []).append(text)
+                    ppos = pos if pos is not None else -1
+                    punct_by_slot.setdefault(sl, []).append((ppos, text))
                 else:
                     sl = slot if slot is not None else 0
                     text_by_slot[sl] = text_by_slot.get(sl, '') + text
@@ -1143,10 +1264,19 @@ def _rebuild_paragraph_xml(
                 parts_xml = csr_xml
                 for oi, ol in enumerate(orig_lens):
                     part_text = text_by_slot.get(oi, '')
-                    punct_text = ''.join(punct_by_slot.get(oi, []))
-                    full_part = part_text + punct_text
+                    # 句号按 after_pos 在 slot 内部插入（隐患 2 修复）：
+                    # pos = 句号跟随字符在 slot 内的偏移，插入到该字符之后；
+                    # 必须倒序插入——顺序插入会因 part_text 变长导致后续
+                    # pos 偏移错位（丢字/错位）；pos 无效时回退到 slot 末尾
+                    for ppos, ptext in sorted(
+                            punct_by_slot.get(oi, []), reverse=True):
+                        if 0 <= ppos < len(part_text):
+                            part_text = (part_text[:ppos + 1] + ptext
+                                         + part_text[ppos + 1:])
+                        else:
+                            part_text += ptext
                     old_ctag = f'<Content>{orig_contents[oi]}</Content>'
-                    new_ctag = f'<Content>{_xml_escape(full_part)}</Content>'
+                    new_ctag = f'<Content>{_xml_escape(part_text)}</Content>'
                     parts_xml = parts_xml.replace(old_ctag, new_ctag, 1)
                 if is_split_copy:
                     parts_xml = re.sub(r'<Br\s*/>', '', parts_xml)
@@ -1157,7 +1287,7 @@ def _rebuild_paragraph_xml(
 
         if not has_punct_inside:
             # 单 Content、无拆分：全部文字合并
-            text = ''.join(t for _, t, _ in segments)
+            text = ''.join(t for _, t, _, _ in segments)
             csr_replacements[ci] = (
                 csr_prefix
                 + f'<Content>{_xml_escape(text)}</Content>'
@@ -1176,11 +1306,12 @@ def _rebuild_paragraph_xml(
                 r'<Group[^>]*>.*?</Group>', '', clean_prefix, flags=re.DOTALL
             )
             clean_suffix = csr_xml[csr_xml.rfind('</CharacterStyleRange>'):]
-            non_punct_parts = [i for i, (is_p, _, _) in enumerate(segments) if not is_p]
+            non_punct_parts = [i for i, (is_p, _, _, _) in enumerate(segments)
+                               if not is_p]
             # 找到最后一个文本 segment 的索引，供句号继承其前缀
             last_text_idx: int | None = None
             parts = []
-            for i, (is_p, text, _slot) in enumerate(segments):
+            for i, (is_p, text, _slot, _pos) in enumerate(segments):
                 if is_p:
                     if last_text_idx is not None:
                         # 句号继承 last_text_idx 对应文字的前缀
@@ -1372,34 +1503,121 @@ def _rebuild_story_xml(header: str, para_xmls: list[str], footer: str) -> str:
     return header + '\n'.join(para_xmls) + footer
 
 
-def _write_stories_to_idml(idml_path: str, new_story_xmls: dict[str, str]) -> None:
-    """将修改后的 Story XML 写回 IDML ZIP 文件。
+def _stream_write_idml(
+    src_path: str,
+    dst_path: str,
+    story_updates: dict[str, str],
+    progress_cb=None,
+) -> None:
+    """流式写回 IDML：未修改成员流式拷贝，指定 Story 直写新 XML。
 
-    读取 IDML ZIP 的全部内容到内存，替换指定 Story 的 XML，然后写回。
-    非 Story 文件（图片、字体、designmap 等）原样保留。
+    与旧版 _write_stories_to_idml 不同：不再把整个 ZIP 全量读入内存，
+    内存占用 O(最大单个成员)。未修改成员按原 ZipInfo 流式复制，
+    保留其压缩方式、时间戳与扩展属性。
 
     参数:
-        idml_path: IDML 文件路径（已由 shutil.copy2 复制为目标文件）。
-        new_story_xmls: 映射 story_name -> 新的 Story XML 字符串。
+        src_path: 源 IDML 文件路径。
+        dst_path: 输出 IDML 文件路径（先写临时文件再原子替换）。
+        story_updates: 映射 story_name -> 新的 Story XML 字符串。
+        progress_cb: 可选回调 progress_cb(done, total, name, bytes_total)。
     """
-    # 读取原始 ZIP 全部内容
-    with zipfile.ZipFile(idml_path, 'r') as zf:
-        all_files: dict[str, bytes] = {}
-        for name in zf.namelist():
-            all_files[name] = zf.read(name)
+    tmp_path = dst_path + '.tmp'
+    bytes_total = 0
+    try:
+        with zipfile.ZipFile(src_path, 'r') as in_zf, \
+             zipfile.ZipFile(tmp_path, 'w') as out_zf:
+            infos = in_zf.infolist()
+            n_total = len(infos)
+            for i, zinfo in enumerate(infos, 1):
+                name = zinfo.filename
+                m = re.match(r'^Stories/Story_(.+)\.xml$', name)
+                if m and m.group(1) in story_updates:
+                    new_xml = story_updates[m.group(1)]
+                    out_zf.writestr(zinfo, new_xml.encode('utf-8'))
+                    bytes_total += len(new_xml)
+                else:
+                    # 流式拷贝，保留原 zinfo 的压缩方式/时间戳/扩展属性
+                    with in_zf.open(zinfo) as src, out_zf.open(zinfo, 'w') as dst:
+                        shutil.copyfileobj(src, dst)
+                    bytes_total += zinfo.file_size
+                if progress_cb:
+                    progress_cb(i, n_total, name, bytes_total)
+        os.replace(tmp_path, dst_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
 
-    # 替换修改过的 Story XML
-    for story_name, new_xml in new_story_xmls.items():
-        story_path = f'Stories/Story_{story_name}.xml'
-        if story_path in all_files:
-            all_files[story_path] = new_xml.encode('utf-8')
+
+def _rebuild_one_story(
+    story: dict,
+    story_idx: int,
+    meta: dict,
+    split_sources: dict,
+    global_punct_template: str | None,
+) -> tuple[str, int, int, int]:
+    """重建单个 Story 的完整 XML（含分割段落处理）。
+
+    返回: (story_xml, rebuilt_count, unchanged_count, split_count)
+    """
+    max_orig_para_idx = len(story['paragraphs'])
+
+    # 构建 (position, para_xml) 列表用于排序
+    # position: 原始段落用 para_idx，分割段落用 source_para_idx + 0.5
+    positioned_parts: list[tuple[float, str]] = []
+    rebuilt_count = 0
+    unchanged_count = 0
+
+    # 处理原始段落
+    for para_idx, para in enumerate(story['paragraphs']):
+        para_records = meta.get(para_idx, [])
+
+        if para_records:
+            new_psr_xml = _rebuild_paragraph_xml(
+                para['raw_xml'], para_records, global_punct_template
+            )
+            rebuilt_count += 1
         else:
-            print(f"  警告: Story 文件 {story_path} 在 ZIP 中未找到，跳过")
+            new_psr_xml = para['raw_xml']
+            unchanged_count += 1
 
-    # 写回 ZIP
-    with zipfile.ZipFile(idml_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for name, data in all_files.items():
-            zf.writestr(name, data)
+        positioned_parts.append((float(para_idx), new_psr_xml))
+
+    # 处理因空行边界而分割出的新段落（para_idx >= max_orig_para_idx）
+    extra_para_indices = sorted(
+        [pi for pi in meta if pi >= max_orig_para_idx]
+    )
+    split_count = 0
+    for para_idx in extra_para_indices:
+        para_records = meta[para_idx]
+        # 找到分割来源段落，使用其 raw_xml 作为模板
+        source_key = (story_idx, para_idx)
+        source_para_idx = split_sources.get(source_key)
+        if source_para_idx is not None and source_para_idx < len(story['paragraphs']):
+            template_xml = story['paragraphs'][source_para_idx]['raw_xml']
+            # 新段落插入到源段落之后（position = source + 0.5）
+            position = float(source_para_idx) + 0.5
+        else:
+            # 回退：使用最后一个段落作为模板，放在末尾
+            template_xml = story['paragraphs'][-1]['raw_xml']
+            position = float(len(story['paragraphs']))
+        new_psr_xml = _rebuild_paragraph_xml(
+            template_xml, para_records, global_punct_template,
+            is_split_copy=True,
+        )
+        positioned_parts.append((position, new_psr_xml))
+        split_count += 1
+
+    # 按位置排序
+    positioned_parts.sort(key=lambda x: x[0])
+    story_xml_parts = [pxml for _, pxml in positioned_parts]
+
+    return (
+        _rebuild_story_xml(story['xml_header'], story_xml_parts, story['xml_footer']),
+        rebuilt_count,
+        unchanged_count,
+        split_count,
+    )
 
 
 def generate_idml(
@@ -1409,14 +1627,14 @@ def generate_idml(
     split_sources: dict,
     output_path: str,
 ) -> None:
-    """将新字符记录写回 IDML。
+    """将新字符记录写回 IDML（流式，不驻留全部 Story XML）。
 
     核心流程:
-        1. 复制原始 IDML 到输出路径
-        2. 遍历每个 Story，对每个段落取对应的 grouped_records
-        3. 用新记录重建 ParagraphStyleRange XML
-        4. 拼接完整 Story XML
-        5. 写回 ZIP
+        1. 预扫描全局句号 CSR 模板（用于没有原句号 CSR 的段落）
+        2. 打开输入 ZIP 与临时输出 ZIP，逐成员处理：
+           - 需要修改的 Story：重建后直写
+           - 其余成员（图片、字体、designmap 等）：流式拷贝
+        3. 原子替换为输出文件
 
     参数:
         idml_path: 原始 IDML 文件路径。
@@ -1427,9 +1645,6 @@ def generate_idml(
             指示分割产生的新段落的来源段落。
         output_path: 输出 IDML 文件的路径。
     """
-    # 复制原始 IDML
-    shutil.copy2(idml_path, output_path)
-
     # 查找全局句号 CSR 模板（用于没有原句号 CSR 的段落）
     global_punct_template: str | None = None
     for story in stories:
@@ -1445,78 +1660,87 @@ def generate_idml(
         if global_punct_template:
             break
 
-    new_story_xmls: dict[str, str] = {}
+    # story_name → (story_idx, story)
+    story_by_name: dict[str, tuple[int, dict]] = {
+        story['name']: (idx, story) for idx, story in enumerate(stories)
+    }
+    # 需要修改的 story_name 集合（grouped_records 的 key 是 story_idx）
+    modified_names = {
+        stories[story_idx]['name']
+        for story_idx in grouped_records
+        if story_idx < len(stories)
+    }
+
     para_rebuilt_count = 0
     para_unchanged_count = 0
     para_split_count = 0
 
-    for story_idx, story in enumerate(stories):
-        meta = grouped_records.get(story_idx, {})
-        max_orig_para_idx = len(story['paragraphs'])
-
-        # 构建 (position, para_xml) 列表用于排序
-        # position: 原始段落用 para_idx，分割段落用 source_para_idx + 0.5
-        positioned_parts: list[tuple[float, str]] = []
-
-        # 处理原始段落
-        for para_idx, para in enumerate(story['paragraphs']):
-            para_records = meta.get(para_idx, [])
-
-            if para_records:
-                new_psr_xml = _rebuild_paragraph_xml(
-                    para['raw_xml'], para_records, global_punct_template
-                )
-                para_rebuilt_count += 1
-            else:
-                new_psr_xml = para['raw_xml']
-                para_unchanged_count += 1
-
-            positioned_parts.append((float(para_idx), new_psr_xml))
-
-        # 处理因空行边界而分割出的新段落（para_idx >= max_orig_para_idx）
-        extra_para_indices = sorted(
-            [pi for pi in meta if pi >= max_orig_para_idx]
-        )
-        for para_idx in extra_para_indices:
-            para_records = meta[para_idx]
-            # 找到分割来源段落，使用其 raw_xml 作为模板
-            source_key = (story_idx, para_idx)
-            source_para_idx = split_sources.get(source_key)
-            if source_para_idx is not None and source_para_idx < len(story['paragraphs']):
-                template_xml = story['paragraphs'][source_para_idx]['raw_xml']
-                # 新段落插入到源段落之后（position = source + 0.5）
-                position = float(source_para_idx) + 0.5
-            else:
-                # 回退：使用最后一个段落作为模板，放在末尾
-                template_xml = story['paragraphs'][-1]['raw_xml']
-                position = float(len(story['paragraphs']))
-            new_psr_xml = _rebuild_paragraph_xml(
-                template_xml, para_records, global_punct_template,
-                is_split_copy=True,
-            )
-            positioned_parts.append((position, new_psr_xml))
-            para_split_count += 1
-
-        # 按位置排序
-        positioned_parts.sort(key=lambda x: x[0])
-        story_xml_parts = [pxml for _, pxml in positioned_parts]
-
-        new_story_xmls[story['name']] = _rebuild_story_xml(
-            story['xml_header'],
-            story_xml_parts,
-            story['xml_footer'],
-        )
+    tmp_path = output_path + '.tmp'
+    try:
+        with zipfile.ZipFile(idml_path, 'r') as in_zf, \
+             zipfile.ZipFile(tmp_path, 'w') as out_zf:
+            infos = in_zf.infolist()
+            n_total = len(infos)
+            for i, zinfo in enumerate(infos, 1):
+                name = zinfo.filename
+                m = re.match(r'^Stories/Story_(.+)\.xml$', name)
+                if m and m.group(1) in modified_names:
+                    story_name = m.group(1)
+                    story_idx, story = story_by_name[story_name]
+                    meta = grouped_records.get(story_idx, {})
+                    new_xml, r_count, u_count, s_count = _rebuild_one_story(
+                        story, story_idx, meta, split_sources,
+                        global_punct_template,
+                    )
+                    para_rebuilt_count += r_count
+                    para_unchanged_count += u_count
+                    para_split_count += s_count
+                    out_zf.writestr(zinfo, new_xml.encode('utf-8'))
+                    if n_total > 10:
+                        print(f"\r  写回 {story_name} "
+                              f"{_progress_bar(i, n_total)}", end='', flush=True)
+                    else:
+                        print(f"  写回 [{i}/{n_total}] {story_name} "
+                              f"(重建 {r_count} + 不变 {u_count} + 分割 {s_count})")
+                else:
+                    with in_zf.open(zinfo) as src, out_zf.open(zinfo, 'w') as dst:
+                        shutil.copyfileobj(src, dst)
+                if n_total > 10 and i % 10 == 0:
+                    print(f"\r  写回 {name} "
+                          f"{_progress_bar(i, n_total)}", end='', flush=True)
+        if n_total > 10:
+            print()
+        os.replace(tmp_path, output_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
 
     print(f"  重建 {para_rebuilt_count} 个段落，{para_unchanged_count} 个段落保持不变，"
           f"{para_split_count} 个新段落（来自分割）")
 
-    _write_stories_to_idml(output_path, new_story_xmls)
+
+def _read_story_xmls(path: str) -> dict[str, str]:
+    """一次打开 ZIP、一次解压全部 Story XML。
+
+    返回: {story_path（如 Stories/Story_u4e8.xml）: xml}
+    供 _verify_structure / _verify_br_count / _verify_output 共享，
+    将验证链的全量解压扫描从 7 次合并为 2 次（输入 1 次 + 输出 1 次）。
+    """
+    result: dict[str, str] = {}
+    with zipfile.ZipFile(path, 'r') as zf:
+        for name in zf.namelist():
+            if name.startswith('Stories/Story_'):
+                result[name] = zf.read(name).decode('utf-8')
+    return result
 
 
 def _verify_structure(
-    input_path: str, output_path: str,
+    in_story_xmls: dict[str, str],
+    out_story_xmls: dict[str, str],
     stories: list[dict], split_sources: dict,
     grouped_records: dict,
+    output_path: str,
 ) -> None:
     """输出 IDML 结构完整性验证（在写入 ZIP 后、返回前调用）。
 
@@ -1528,18 +1752,17 @@ def _verify_structure(
     5. 所有文字 Content 可被正确解析
 
     任何检查失败都会删除输出文件并抛出 ValueError。
+
+    参数: in_story_xmls/out_story_xmls 由 _read_story_xmls 预加载共享，
+    避免多次全量解压扫描。
     """
     errors: list[str] = []
 
     # ---- 1: Group Self ID 唯一性 ----
     group_ids: dict[str, list[str]] = {}  # {id: [story_name, ...]}
-    with zipfile.ZipFile(output_path, 'r') as zf:
-        for name in zf.namelist():
-            if not name.startswith('Stories/Story_'):
-                continue
-            xml = zf.read(name).decode('utf-8')
-            for gid in re.findall(r'Self="([^"]+)"', xml):
-                group_ids.setdefault(gid, []).append(name)
+    for name, xml in out_story_xmls.items():
+        for gid in re.findall(r'Self="([^"]+)"', xml):
+            group_ids.setdefault(gid, []).append(name)
 
     dup_groups = {gid: stories for gid, stories in group_ids.items()
                   if len(stories) > 1}
@@ -1563,37 +1786,32 @@ def _verify_structure(
     br_in_old_punct = 0
     br_in_orig_empty = 0
 
-    with zipfile.ZipFile(input_path, 'r') as in_zf, \
-         zipfile.ZipFile(output_path, 'r') as out_zf:
-        for name in in_zf.namelist():
-            if not name.startswith('Stories/Story_'):
-                continue
-            in_xml = in_zf.read(name).decode('utf-8')
-            out_xml = out_zf.read(name).decode('utf-8')
+    for name, in_xml in in_story_xmls.items():
+        out_xml = out_story_xmls.get(name, '')
 
-            in_br_total += _count_br(in_xml)
-            out_br_total += _count_br(out_xml)
+        in_br_total += _count_br(in_xml)
+        out_br_total += _count_br(out_xml)
 
-            br_in_old_punct += sum(
-                _count_br(m.group(0))
-                for m in re.finditer(csr_pattern, in_xml, re.DOTALL)
-            )
+        br_in_old_punct += sum(
+            _count_br(m.group(0))
+            for m in re.finditer(csr_pattern, in_xml, re.DOTALL)
+        )
 
-            for psr in re.finditer(
-                r'<ParagraphStyleRange[^>]*>.*?</ParagraphStyleRange>',
-                in_xml, re.DOTALL
+        for psr in re.finditer(
+            r'<ParagraphStyleRange[^>]*>.*?</ParagraphStyleRange>',
+            in_xml, re.DOTALL
+        ):
+            for m in re.finditer(
+                r'<CharacterStyleRange([^>]*?)(?:>'
+                r'(.*?)</CharacterStyleRange>|/>)',
+                psr.group(0), re.DOTALL
             ):
-                for m in re.finditer(
-                    r'<CharacterStyleRange([^>]*?)(?:>'
-                    r'(.*?)</CharacterStyleRange>|/>)',
-                    psr.group(0), re.DOTALL
-                ):
-                    contents = re.findall(
-                        r'<Content>(.*?)</Content>',
-                        m.group(0), re.DOTALL
-                    )
-                    if not any(c.strip() for c in contents):
-                        br_in_orig_empty += _count_br(m.group(0))
+                contents = re.findall(
+                    r'<Content>(.*?)</Content>',
+                    m.group(0), re.DOTALL
+                )
+                if not any(c.strip() for c in contents):
+                    br_in_orig_empty += _count_br(m.group(0))
 
     br_min = max(0, in_br_total - br_in_old_punct - br_in_orig_empty)
 
@@ -1605,17 +1823,11 @@ def _verify_structure(
         )
 
     # ---- 3: 分割段落无 leading Br ----
-    with zipfile.ZipFile(output_path, 'r') as zf:
-        story_xmls = {}
-        for name in zf.namelist():
-            if name.startswith('Stories/Story_'):
-                story_xmls[name] = zf.read(name).decode('utf-8')
-
     for (si, new_pi), orig_pi in split_sources.items():
-        story_name = f'Stories/Story_{stories[si]["name"]}.xml'
-        if story_name not in story_xmls:
+        story_path = f'Stories/Story_{stories[si]["name"]}.xml'
+        if story_path not in out_story_xmls:
             continue
-        xml = story_xmls[story_name]
+        xml = out_story_xmls[story_path]
         psrs = list(re.finditer(
             r'<ParagraphStyleRange[^>]*>.*?</ParagraphStyleRange>',
             xml, re.DOTALL
@@ -1656,10 +1868,10 @@ def _verify_structure(
         expected_paras += len(extras)
 
         story_path = f"Stories/Story_{story['name']}.xml"
-        if story_path in story_xmls:
+        if story_path in out_story_xmls:
             actual_total += len(re.findall(
                 r'<ParagraphStyleRange[^>]*>',
-                story_xmls[story_path], re.DOTALL
+                out_story_xmls[story_path], re.DOTALL
             ))
 
     if actual_total != expected_paras:
@@ -1680,8 +1892,11 @@ def _verify_structure(
         )
 
 
-def _verify_br_count(input_path: str, output_path: str) -> None:
-    """报告输入/输出 IDML 的 Br 数量变化。
+def _verify_br_count(
+    in_story_xmls: dict[str, str],
+    out_story_xmls: dict[str, str],
+) -> None:
+    """报告输入/输出 IDML 的 Br 数量变化（纯计算，不重复读盘）。
 
     预期变化：
     1. 旧句号 CSR 的 Br → 清除（句号由新 punct 模板接管）
@@ -1698,19 +1913,14 @@ def _verify_br_count(input_path: str, output_path: str) -> None:
     out_br_total = 0
     br_in_old_punct = 0
 
-    with zipfile.ZipFile(input_path, 'r') as in_zf, \
-         zipfile.ZipFile(output_path, 'r') as out_zf:
-        for name in in_zf.namelist():
-            if not name.startswith('Stories/Story_'):
-                continue
-            in_xml = in_zf.read(name).decode('utf-8')
-            out_xml = out_zf.read(name).decode('utf-8')
-            in_br_total += _count_br(in_xml)
-            out_br_total += _count_br(out_xml)
-            br_in_old_punct += sum(
-                _count_br(m.group(0))
-                for m in re.finditer(csr_pattern, in_xml, re.DOTALL)
-            )
+    for name, in_xml in in_story_xmls.items():
+        out_xml = out_story_xmls.get(name, '')
+        in_br_total += _count_br(in_xml)
+        out_br_total += _count_br(out_xml)
+        br_in_old_punct += sum(
+            _count_br(m.group(0))
+            for m in re.finditer(csr_pattern, in_xml, re.DOTALL)
+        )
 
     br_cleared_text = in_br_total - br_in_old_punct - out_br_total
 
@@ -1718,14 +1928,21 @@ def _verify_br_count(input_path: str, output_path: str) -> None:
           f"（旧句号清除 {br_in_old_punct}, 清空文字 CSR 清除 {br_cleared_text}）")
 
 
-def _verify_output(output_path: str, expected_chars: list[str]) -> None:
+def _verify_output(
+    output_path: str,
+    expected_chars: list[str],
+    preloaded_xmls: dict[str, str] | None = None,
+) -> None:
     """输出自检：从生成的 IDML 重新提取字符序列并与输入比对。
 
     如果发现任何差异，立即删除输出文件并抛出异常。
     这是防止写入过程（XML 重建、ZIP 打包）引入数据丢失的最后一道防线。
+
+    参数: preloaded_xmls 由 _read_story_xmls 预加载共享，
+    避免全量解压扫描与 Story XML 二次驻留。
     """
-    # 重新提取
-    stories = extract_from_idml(output_path)
+    # 重新提取（复用预加载的 Story XML，避免再次解压）
+    stories = extract_from_idml(output_path, preloaded_xmls=preloaded_xmls)
     all_records: list[dict] = []
     for story in stories:
         story_clean = sum(
@@ -1793,6 +2010,7 @@ def _verify_output(output_path: str, expected_chars: list[str]) -> None:
 
 def process(idml_path, result_path, output_path):
     """主处理流程"""
+    t0 = time.time()
     print("=" * 60)
     print("IDML 句读结果回注工具")
     print("=" * 60)
@@ -1803,7 +2021,8 @@ def process(idml_path, result_path, output_path):
     total_chars = sum(
         len(p['chars']) for s in stories for p in s['paragraphs']
     )
-    print(f"  提取 {len(stories)} 个 Story, {total_chars} 个字符记录")
+    print(f"  提取 {len(stories)} 个 Story, {total_chars} 个字符记录"
+          f"{_mem_suffix()}")
 
     # Step 2: 从句读结果提取
     print("\n[2/5] 读取句读结果...")
@@ -1823,12 +2042,16 @@ def process(idml_path, result_path, output_path):
     # Step 4: 生成输出
     print("\n[4/5] 生成输出 IDML...")
     generate_idml(idml_path, stories, grouped_records, split_sources, output_path)
+    print(f"  生成完成{_mem_suffix()}")
 
     # Step 5: 多层验证 — 结构 → Br → 字符
     print("\n[5/5] 验证输出 IDML...")
-    _verify_structure(idml_path, output_path, stories,
-                      split_sources, grouped_records)
-    _verify_br_count(idml_path, output_path)
+    # 合并读盘：输入 1 次 + 输出 1 次全量解压，三处验证共享
+    in_story_xmls = _read_story_xmls(idml_path)
+    out_story_xmls = _read_story_xmls(output_path)
+    _verify_structure(in_story_xmls, out_story_xmls, stories,
+                      split_sources, grouped_records, output_path)
+    _verify_br_count(in_story_xmls, out_story_xmls)
     # 构建验证用的 expected：从 alignment new_records 提取
     # （用 new_records 而非 result_chars，因为 。 抑制已将 。 替换为 U+3000）
     verify_expected: list[str] = []
@@ -1837,10 +2060,12 @@ def process(idml_path, result_path, output_path):
             for r in recs2:
                 if not _is_unicode_whitespace(r['char']):
                     verify_expected.append(r['char'])
-    _verify_output(output_path, verify_expected)
+    _verify_output(output_path, verify_expected,
+                   preloaded_xmls=out_story_xmls)
 
     print(f"\n{'=' * 60}")
     print(f"完成！输出文件: {output_path}")
+    print(f"总耗时 {time.time() - t0:.1f}s{_mem_suffix()}")
     print(f"{'=' * 60}")
 
 

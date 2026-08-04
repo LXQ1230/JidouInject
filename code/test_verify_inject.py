@@ -80,19 +80,29 @@ def test_275():
     # ---- 检查 5: 输出自检 ----
     print("\n[5] 输出字符序列与输入一致...")
     from inject import _verify_output
+    # 与 process() 一致的验证方式：从对齐后的 new_records 提取 expected
+    # （「。」抑制场景下被抑制的句号转为 U+3000 保留在输出，不再计入比对）
+    verify_expected: list[str] = []
+    for recs in alignment['grouped'].values():
+        for recs2 in recs.values():
+            for r in recs2:
+                if not _is_unicode_whitespace(r['char']):
+                    verify_expected.append(r['char'])
     try:
-        _verify_output(output_path, result_data['chars'])
+        _verify_output(output_path, verify_expected)
         print("    ✓ 通过")
     except ValueError as e:
         print(f"    ✗ {e}")
         raise
 
-    # 清理
-    os.remove(output_path)
+    # 清理（沙箱回收站不可用时容忍残留临时文件）
+    try:
+        os.remove(output_path)
+    except OSError:
+        pass
     print(f"\n{'=' * 60}")
     print("全部检查通过 ✓")
     print(f"{'=' * 60}")
-
 
 def _extract_clean_chars(path: str) -> list[str]:
     """提取 IDML 中所有非标点、非比对空白的文字。
@@ -278,14 +288,25 @@ def test_461():
 
     # 检查 4: 输出自检
     print("\n[4] 输出字符序列与输入一致...")
+    # 与 process() 一致的验证方式：从对齐后的 new_records 提取 expected
+    verify_expected: list[str] = []
+    for recs in alignment['grouped'].values():
+        for recs2 in recs.values():
+            for r in recs2:
+                if not _is_unicode_whitespace(r['char']):
+                    verify_expected.append(r['char'])
     try:
-        _verify_output(output_path, result_data['chars'])
+        _verify_output(output_path, verify_expected)
         print("    ✓ 通过")
     except ValueError as e:
         print(f"    ✗ {e}")
         raise
 
-    os.remove(output_path)
+    # 清理（沙箱回收站不可用时容忍残留临时文件）
+    try:
+        os.remove(output_path)
+    except OSError:
+        pass
     print(f"\n{'=' * 60}")
     print("全部检查通过 ✓")
     print(f"{'=' * 60}")

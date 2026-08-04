@@ -3,7 +3,9 @@
     "allow": [
       "Bash(claude plugins *)",
       "Bash(rm -rf __pycache__)",
-      "Bash(rm -f \"275导出_WD注入_dbg\"*)"
+      "Bash(rm -f \"275导出_WD注入_dbg\"*)",
+      "Bash(chcp 65001)",
+      "Bash(xxd \"D:/Desktop/JidouInject/0080.txt\")"
     ]
   }
 }
