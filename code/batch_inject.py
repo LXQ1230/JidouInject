@@ -51,8 +51,8 @@ def find_pairs():
 
     规则：
     - IDML：*.idml 即可
-    - MD/TXT：*.md 或 *.txt，且文件名必须包含"句读结果"字样
-      （强校验句读结果身份，排除 *导出.txt 等原文导出文本冒充结果）
+    - MD/TXT：*.md 或 *.txt 即可（经用户确认：凡放入 pending/ 的
+      .md/.txt 均视为句读结果，不再要求文件名含"句读结果"字样）
     - 排除注入输出文件（含 _WD注入）与测试文件（*_test* / *_old_test*）
     - 配对：提取文件名开头的数字（经号），相同经号即配为一对
     """
@@ -73,12 +73,12 @@ def find_pairs():
                 continue
             idml_by_number.setdefault(num, []).append(f)
 
-    # 按经号分组 MD/TXT（强校验句读结果身份：文件名必须含"句读结果"，
-    # 排除导出原文 *导出.txt 与注入输出 _WD注入、测试文件）
+    # 按经号分组 MD/TXT（*.md / *.txt 即可，经用户确认 pending/ 中
+    # 的 .md/.txt 均视为句读结果；排除注入输出 _WD注入 与测试文件）
     md_by_number: dict[str, list[str]] = {}
     for f in all_files:
         if (f.endswith(".md") or f.endswith(".txt")) \
-           and "句读结果" in f and "_WD注入" not in f \
+           and "_WD注入" not in f \
            and not _is_excluded_test_file(f):
             num = _extract_number(f)
             if num is None:
@@ -92,9 +92,14 @@ def find_pairs():
         idml_list = idml_by_number[num]
         md_list = md_by_number.get(num, [])
 
+        # 先检查句读结果是否存在（必须在索引访问之前，否则空列表
+        # 会在 md_chosen = md_list[0] 处抛 IndexError）
+        if not md_list:
+            print(f"警告: 经号 {num} 找不到对应句读结果，跳过")
+            continue
+
         # P2-2: 同经号多文件时按优先级选择，而非固定取第一个：
-        #   IDML：含「导出」优先；句读结果：含「句读结果」优先
-        #   剩余按文件名排序取第一个（确定性）
+        #   IDML：含「导出」优先；句读结果：按文件名排序取第一个（确定性）
         if len(idml_list) > 1:
             pref = [f for f in idml_list if "导出" in f]
             idml_chosen = (pref or sorted(idml_list))[0]
@@ -103,16 +108,11 @@ def find_pairs():
         else:
             idml_chosen = idml_list[0]
         if len(md_list) > 1:
-            pref = [f for f in md_list if "句读结果" in f]
-            md_chosen = (pref or sorted(md_list))[0]
-            print(f"警告: 经号 {num} 有多个句读结果 ({md_list})，"
+            md_chosen = sorted(md_list)[0]
+            print(f"警告: 经号 {num} 有多个候选结果文件 ({md_list})，"
                   f"优先选择: {md_chosen}")
         else:
             md_chosen = md_list[0]
-
-        if not md_list:
-            print(f"警告: 经号 {num} ({idml_chosen}) 找不到对应句读结果，跳过")
-            continue
 
         pairs.append((
             os.path.join(PENDING_DIR, idml_chosen),
