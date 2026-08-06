@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
 IDML 句读结果回注工具
-将 _WD句读结果.md 中的文字和「。」注入回 IDML，排版样式原封不动。
+将 _WD句读结果.md 中的文字和白名单标点（，、；：？！。）注入回 IDML，
+排版样式原封不动。
 
 用法:
     python inject.py --idml 275导出.idml --result 275从ID中导出文字_WD句读结果.md
     或拖拽两个文件到 inject.bat 上
+
+版本: v1.5.0（2026-08-06 标点开放）— 回注标点从仅「。」扩展为
+_INJECTABLE_PUNCT（，、；：？！。），抑制规则对新标点一视同仁，
+样式沿用 CharacterStyle/句号 模板、Content 替换为实际标点。
 """
 
 import sys
@@ -133,10 +138,30 @@ def _is_old_punct(ch: str) -> bool:
     return ch in _OLD_PUNCT_CHARS
 
 
+# 可回注标点白名单（v1.5.0）— 句读结果中允许出现、并可注入回 IDML 的标点。
+# 原实现仅允许「。」（FIX-1B 会拒绝任何非句号标点）。v1.5.0 开放为常用
+# 中文标点全套：句号/逗号/顿号/分号/冒号/问号/叹号。
+# 此集合之外的旧标点（引号、括号、书名号、省略号等成对/装饰符号）仍被
+# 拒绝——它们多为原文排版符号，不属于句读结果。
+#
+# 注意：此集合是 _OLD_PUNCT_CHARS 的子集。回注时该集合内的标点作为
+# 「可注入标点」处理（校验时排除、对齐时插入、重建时生成独立 CSR）；
+# 集合外的旧标点在结果文件中出现即拒绝（疑似以原文导出文本冒充结果）。
+_INJECTABLE_PUNCT: frozenset[str] = frozenset('，、；：？！。')
+
+
 # P3-11: 非法 HTML 实体替换计数器。
 # html.unescape 对非法实体（保留码位/超范围等）输出 U+FFFD 替换字符，
 # 需计数并警告，防止静默的字符损坏进入输出。
 _REPLACEMENT_COUNT: dict[str, int] = {'replaced': 0}
+
+# P3-14: 分割副本空壳 CSR 删除哨兵。_rebuild_paragraph_xml 中
+# csr_replacements 的值若为此对象，表示该 CSR 在重建输出中整体删除。
+# 用于分割段落（is_split_copy=True）的无记录空壳 CSR —— 原实现输出
+# 清空后的空壳，4319 个分割段 × 源段数百个空 CSR 骨架导致输出解压体积
+# 膨胀 19 倍（497 的 Story_u562：71MB → 1364MB），验证阶段需反复全量
+# 正则扫描该体积，单次运行耗时 20 分钟以上。
+_DROP_CSR = object()
 
 
 def _unescape_entities(text: str) -> str:
@@ -202,20 +227,31 @@ def _get_prev_non_ws_font(
     idml_idx: int,
     idml_clean_indices: list[int],
     all_idml_records: list[dict],
+    anchor: tuple | None = None,
 ) -> str | None:
     """从 idml_idx 往回找上一个非空白文字字符，返回其字体名。
 
-    P2-3: 不跨 Story/段落边界——前一个记录与当前记录不同 story 或 para
-    时按 None 处理（视为无前字），避免跨边界取到装饰/相邻段落的字体，
-    造成错误的抑制判断。
+    P2-3: 不跨 Story/段落边界。边界判定以 anchor（(story_idx, para_idx)，
+    即句号槽位所属段落的 story/para）为基准：前一个记录与 anchor 不同
+    story 或 para 时按 None 处理（视为无前字），避免跨边界取到装饰/相
+    邻段落的字体，造成错误的抑制判断。
+
+    必须用 anchor 而非 idml_idx 处记录作基准：句号槽位位于段落末尾时，
+    idml_idx 已指向下一段的首字，若以该字为基准，前向扫描会立即跨段而
+    误报「无前字」（P3-12）。anchor 为 None（无槽位上下文）时退化为以
+    idml_idx 处记录为准。
     """
     if not (0 <= idml_idx < len(idml_clean_indices)):
         return None
-    cur = all_idml_records[idml_clean_indices[idml_idx]]
+    if anchor is not None:
+        bound = anchor
+    else:
+        cur = all_idml_records[idml_clean_indices[idml_idx]]
+        bound = (cur['story_idx'], cur['para_idx'])
     for j in range(idml_idx - 1, -1, -1):
         ti = idml_clean_indices[j]
         rec = all_idml_records[ti]
-        if (rec['story_idx'], rec['para_idx']) != (cur['story_idx'], cur['para_idx']):
+        if (rec['story_idx'], rec['para_idx']) != bound:
             return None  # 跨 Story/段落边界
         if not _is_ws_for_compare(rec['char']):
             return rec.get('font')
@@ -226,19 +262,28 @@ def _get_next_non_ws_font(
     idml_idx: int,
     idml_clean_indices: list[int],
     all_idml_records: list[dict],
+    anchor: tuple | None = None,
 ) -> str | None:
     """从 idml_idx 向前找下一个非空白文字字符，返回其字体名。
 
-    P2-3: 不跨 Story/段落边界——后一个记录与当前记录不同 story 或 para
-    时按 None 处理（视为无后字），避免跨边界取字体。
+    P2-3: 不跨 Story/段落边界。边界判定以 anchor（句号槽位所属段落的
+    story/para）为基准：后一个记录与 anchor 不同 story 或 para 时按
+    None 处理（视为无后字）。句号槽位位于段落末尾时，下一段的首字不
+    属于槽位所在段落，应视为无后字，避免下一段字体（如偈颂仿宋）影响
+    本段句号的抑制判定（P3-12）。anchor 为 None 时退化为以 idml_idx
+    处记录为准。
     """
     if not (0 <= idml_idx < len(idml_clean_indices)):
         return None
-    cur = all_idml_records[idml_clean_indices[idml_idx]]
+    if anchor is not None:
+        bound = anchor
+    else:
+        cur = all_idml_records[idml_clean_indices[idml_idx]]
+        bound = (cur['story_idx'], cur['para_idx'])
     for j in range(idml_idx, len(idml_clean_indices)):
         ti = idml_clean_indices[j]
         rec = all_idml_records[ti]
-        if (rec['story_idx'], rec['para_idx']) != (cur['story_idx'], cur['para_idx']):
+        if (rec['story_idx'], rec['para_idx']) != bound:
             return None  # 跨 Story/段落边界
         if not _is_ws_for_compare(rec['char']):
             return rec.get('font')
@@ -250,7 +295,10 @@ def _should_suppress_punct(
     all_idml_records: list[dict],
     last_slot: tuple | None,
 ) -> bool:
-    """判断 WD 结果中的 。 是否应被抑制。
+    """判断 WD 结果中的标点（。或 v1.5.0 开放的其他白名单标点）是否应被抑制。
+
+    函数本身对标点类型无感（基于槽位位置与前后字体判断），因此
+    白名单内所有标点（，、；：？！。）统一走同一套抑制规则（一视同仁）。
 
     规则 A（仿宋/楷体 — 区域内抑制）：
         前字属于仿宋/楷体 → 无条件抑制 （无论后字是什么）。
@@ -261,14 +309,20 @@ def _should_suppress_punct(
     规则 B（思源宋体 — 仅 U+3000 间隔抑制）：
         同 CSR + 思源宋体 + 两字间有 U+3000 → 抑制 。。
         保留偈颂/目录中 U+3000 空格间隔的原样排版。
+
+    前字/后字的查找以句号槽位所属段落（last_slot 的 story/para）为边界
+    基准（P3-12）：段尾句号不会误取下一段的字体，段首也不会误丢本段前字。
     """
     if last_slot is None:
         return False
 
+    # P3-12: 以槽位所属段落为跨段边界基准，而非 idml_idx 处记录
+    # （段尾句号时 idml_idx 已指向下一段首字，以它为基准会误报无前字）
+    anchor = (last_slot[0], last_slot[1])
     font_prev = _get_prev_non_ws_font(idml_idx, idml_clean_indices,
-                                       all_idml_records)
+                                       all_idml_records, anchor)
     font_next = _get_next_non_ws_font(idml_idx, idml_clean_indices,
-                                       all_idml_records)
+                                       all_idml_records, anchor)
 
     is_prev_always = _is_suppress_always_target(font_prev)
     is_next_always = _is_suppress_always_target(font_next)
@@ -284,6 +338,7 @@ def _should_suppress_punct(
         return False      # 思源散文末尾句号 → 放行
 
     # ── 规则B：思源宋体 — U+3000 间隔抑制（现有逻辑） ──
+    # 若抑制成立，标点不插入；IDML 原文的 U+3000 仍作为 IDML 记录保留在输出中。
     if idml_idx >= len(idml_clean_indices):
         return False
 
@@ -631,10 +686,29 @@ def extract_from_idml(
         # 若用 enumerate 序号作为 story_idx 会带空洞，导致 grouped/split_sources
         # 的 key 与 stories 列表索引错位（隐患：stories[story_idx] 越界被静默跳过重建）。
         # 因此 story_idx 取 stories 列表的实际索引（无空洞），保证全局一致性。
-        n_order = len(story_order)
+        #
+        # P3-14: 进度条分母必须用"实际存在的 Story 文件数"而非 designmap 声明数。
+        # IDML 的 StoryList 常含已删除/未导出的 story 引用（如 ub3/uac），文件缺失
+        # 时循环 continue 跳过；若分母用声明数，进度条永远到不了 100%
+        # （如 497：声明 39 / 实际 38 → 最大显示 97.4%）。提前统计实际数量，
+        # 并一次性缓存 namelist（避免循环内反复重建成员列表）。
+        member_names = set(zf.namelist())
+        n_available = sum(
+            1 for s in story_order
+            if f'Stories/Story_{s}.xml' in member_names
+        )
+        n_missing = len(story_order) - n_available
+        if n_missing:
+            missing_names = [
+                s for s in story_order
+                if f'Stories/Story_{s}.xml' not in member_names
+            ]
+            print(f"  [提示] designmap 声明 {len(story_order)} 个 Story，"
+                  f"其中 {n_missing} 个文件缺失已跳过: "
+                  f"{', '.join(missing_names)}")
         for story_name in story_order:
             story_path = f'Stories/Story_{story_name}.xml'
-            if story_path not in zf.namelist():
+            if story_path not in member_names:
                 continue
 
             if preloaded_xmls is not None and story_path in preloaded_xmls:
@@ -653,12 +727,12 @@ def extract_from_idml(
                 'xml_footer': _get_story_footer(story_xml),
                 'paragraphs': paragraphs,
             })
-            if n_order > 10:
+            if n_available > 10:
                 # 大文件：逐 Story 显示解析进度（TTY 覆盖式 / 非 TTY 普通日志）
                 _log_progress(
-                    f"\r  解析 Story [{story_idx + 1}/{n_order}] "
-                    f"{story_name}  {_progress_bar(story_idx + 1, n_order)}")
-        if n_order > 10:
+                    f"\r  解析 Story [{story_idx + 1}/{n_available}] "
+                    f"{story_name}  {_progress_bar(story_idx + 1, n_available)}")
+        if n_available > 10:
             print()
 
     # 自检：直接用正则从原始 XML 提取全部 Content 文本，
@@ -764,7 +838,12 @@ def _parse_story_xml(story_xml: str, story_idx: int) -> list[dict]:
     """
     paragraphs: list[dict] = []
 
-    pattern = r'(<ParagraphStyleRange[^>]*>.*?</ParagraphStyleRange>)'
+    # P3-13: 兼容自闭合空段落（<ParagraphStyleRange ... />，InDesign 排版的
+    # 空段标记，无文字内容）。原正则按"开+闭标签"配对会漏算自闭合段，
+    # 导致其被 _get_story_footer 划入尾部、验证阶段开标签数与段落数不一致。
+    # 自闭合段作为空段落（chars=[]）纳入解析；普通段落匹配结果与原来一致。
+    pattern = (r'(<ParagraphStyleRange[^>]*?/>'
+               r'|<ParagraphStyleRange[^>]*>.*?</ParagraphStyleRange>)')
     for para_idx, match in enumerate(re.finditer(pattern, story_xml, re.DOTALL)):
         psr_xml = match.group(1)
         chars = _parse_paragraph_style_range(psr_xml, story_idx, para_idx)
@@ -856,10 +935,15 @@ def _get_story_header(story_xml: str) -> str:
 
 
 def _get_story_footer(story_xml: str) -> str:
-    """提取 Story XML 最后一个 ParagraphStyleRange 之后的内容"""
-    # 找到最后一个 </ParagraphStyleRange> 的位置
+    """提取 Story XML 最后一个段落（含自闭合空段）之后的内容"""
+    # P3-13: 原实现只找最后一个 </ParagraphStyleRange>，若 Story 末尾是
+    # 自闭合空段（<ParagraphStyleRange ... />，无闭标签）会被划入 footer，
+    # 与 _parse_story_xml 的段落边界不一致。改用与解析相同的段落结构正则，
+    # footer 从最后一个段落（普通或自闭合）结束之后开始。
+    pattern = (r'<ParagraphStyleRange[^>]*?/>'
+               r'|<ParagraphStyleRange[^>]*>.*?</ParagraphStyleRange>')
     last_end = 0
-    for m in re.finditer(r'</ParagraphStyleRange>', story_xml):
+    for m in re.finditer(pattern, story_xml, re.DOTALL):
         last_end = m.end()
     if last_end > 0:
         return story_xml[last_end:]
@@ -872,7 +956,7 @@ def extract_from_result(md_path: str) -> dict:
 
     - 跳过文件头（# 标题到第一个 --- 之间的元数据）
     - 忽略空格、制表符等 ASCII 空白字符
-    - 保留可见字符（含「。」和全角空格 U+3000）
+    - 保留可见字符（含白名单标点，v1.5.0 起为 ，、；：？！。；原仅「。」）和全角空格 U+3000
     - 检测空行作为段落边界标记
 
     返回: {
@@ -907,15 +991,20 @@ def extract_from_result(md_path: str) -> dict:
             if chars:
                 para_breaks.add(len(chars))
 
-    # FIX-1B（P0）: 句读结果身份强校验 — AI 句读结果文件应只含文字 + 「。」。
-    # 若含「。以外」的旧标点（，、；：！？等），说明疑似以原文导出文本冒充
-    # 句读结果（原文标点以 。 为主，可令旧校验自洽通过，造成静默错误注入）。
+    # FIX-1B（P0）: 句读结果身份强校验 — AI 句读结果文件应只含文字 + 白名单标点。
+    # 若含白名单以外的旧标点（，；：？！。 之外，如引号、括号、书名号等），
+    # 说明疑似以原文导出文本冒充句读结果（原文标点以 。 为主，可令旧校验自洽
+    # 通过，造成静默错误注入）。
+    # v1.5.0: 白名单从仅「。」扩展为 _INJECTABLE_PUNCT（，、；：？！。）。
+    # 集合外的旧标点仍一律拒绝；注意成对标点（「」（）等）不在白名单内——
+    # 它们在原文中是排版装饰符号，不参与句读，混入结果文件视为异常。
     for ch in chars:
-        if _is_old_punct(ch) and ch != '。':
+        if _is_old_punct(ch) and ch not in _INJECTABLE_PUNCT:
             raise ValueError(
-                f"句读结果文件含非句号旧标点「{ch}」(U+{ord(ch):04X})，"
+                f"句读结果文件含白名单外旧标点「{ch}」(U+{ord(ch):04X})，"
                 f"疑似以原文导出文本冒充句读结果，已拒绝。"
-                f"请确认为真正的句读结果文件（仅文字+句号）。")
+                f"请确认为真正的句读结果文件（仅文字+白名单标点"
+                f"{''.join(sorted(_INJECTABLE_PUNCT))}）。")
 
     return {'chars': chars, 'para_breaks': para_breaks}
 
@@ -928,7 +1017,8 @@ def validate_and_align(
 
     核心逻辑：
     - IDML 的非标点、非特殊标记字符在句读结果中必有对应
-    - 句读结果中新增的「。」插入在对应位置，归属上一字符的段落
+    - 句读结果中新增的标点（v1.5.0 起为白名单 ，、；：？！。）插入在
+      对应位置，归属上一字符的段落
     - 对齐后的每个 new_record 都标记了所属的 (story_idx, para_idx)
     - 句读结果中的空行（段落边界）会触发 IDML 段落分割：
       边界位置的字符及其后续内容分配到新的虚拟段落
@@ -973,12 +1063,15 @@ def validate_and_align(
             continue
         idml_clean_indices.append(i)
 
-    # 比对用的净文字：双方都排除比对空白（含 U+3000）
+    # 比对用的净文字：双方都排除比对空白（含 U+3000）与白名单标点
     idml_compare_chars = [
         all_idml_records[i]['char'] for i in idml_clean_indices
         if not _is_ws_for_compare(all_idml_records[i]['char'])
     ]
-    result_compare_chars = [c for c in result_chars if c != '。' and not _is_ws_for_compare(c)]
+    result_compare_chars = [
+        c for c in result_chars
+        if c not in _INJECTABLE_PUNCT and not _is_ws_for_compare(c)
+    ]
 
     # 逐字比对验证（排除空白字符）
     idml_compare_str = ''.join(idml_compare_chars)
@@ -1035,9 +1128,16 @@ def validate_and_align(
     # split_sources[(si, effective_pi)] = original_pi（仅非原始索引的段落）
     new_split_sources: dict[tuple, int] = {}
 
-    for si, max_pi in orig_para_max.items():
-        next_new_idx[si] = max_pi + 1
-        for pi in range(max_pi + 1):
+    # P3-13: next_new_idx 起点改为"该 Story 段落总数"（含自闭合空段），
+    # 而非 max_pi+1。原实现假设段落索引连续 0..max_pi，但自闭合空段
+    # 无字符记录、不出现在 all_idml_records，导致 max_pi 偏小 1；若该
+    # Story 发生空行分割，第一个分割段索引会撞上自闭合段的 para_idx，
+    # 分割内容会被误当作自闭合段记录而丢失。对无自闭合段的文件
+    # （段落索引连续 0..n-1），para_total == max_pi+1，行为不变。
+    para_total = {i: len(s['paragraphs']) for i, s in enumerate(stories)}
+    for si in orig_para_max:
+        next_new_idx[si] = para_total[si]
+        for pi in range(para_total[si]):
             current_effective[(si, pi)] = pi
 
     idml_idx = 0
@@ -1054,19 +1154,20 @@ def validate_and_align(
                 new_split_sources[(si, new_idx)] = pi
                 next_new_idx[si] = new_idx + 1
 
-        if ch == '。':
-            # 检查是否应抑制 。：IDML 原文此处为 U+3000 分字间隔
-            # 条件：下一个 IDML 文字字符与上一个在同一 CSR 内，且字体为目标字体
+        if ch in _INJECTABLE_PUNCT:
+            # 检查是否应抑制标点：IDML 原文此处为 U+3000 分字间隔或
+            # 前字为仿宋/楷体（规则 A/B，见 _should_suppress_punct）。
+            # v1.5.0: 白名单内所有标点（，、；：？！。）统一走同一抑制逻辑。
             if _should_suppress_punct(idml_idx, idml_clean_indices,
                                        all_idml_records, last_slot):
-                # 目标字体 U+3000 间隔 → 不插入 。
+                # 目标字体 U+3000 间隔/仿宋楷体区域 → 不插入标点。
                 # IDML 原文的 U+3000 作为 IDML 记录保留在输出中，对齐循环继续
                 pass
             else:
                 si, pi, ci, sl, pos = last_slot if last_slot else (0, 0, 0, 0, 0)
                 effective_pi = current_effective.get((si, pi), pi)
                 new_records.append(CharRecord(
-                    char='。',
+                    char=ch,
                     is_punct=True,
                     is_special=False,
                     story_idx=si,
@@ -1128,7 +1229,7 @@ def validate_and_align(
         grouped[si][pi].append(rec)
 
     punct_count = sum(1 for r in new_records if r['is_punct'])
-    print(f"对齐完成: {len(new_records)} 个字符（含 {punct_count} 个句号）")
+    print(f"对齐完成: {len(new_records)} 个字符（含 {punct_count} 个标点）")
 
     return {'grouped': grouped, 'split_sources': new_split_sources}
 
@@ -1146,6 +1247,35 @@ def _xml_escape(text: str) -> str:
     text = text.replace('"', '&quot;')
     text = text.replace("'", '&apos;')
     return text
+
+
+def _punct_content_tag(char: str) -> str:
+    """生成标点字符的 <Content> 标签（含 XML 转义）。
+
+    v1.5.0: 注入标点时的统一 Content 生成入口，标点字符来自句读结果
+    （可能为 ，、；：？！。 中任意一个），而非硬编码「。」。
+    """
+    return f'<Content>{_xml_escape(char)}</Content>'
+
+
+def _punct_csr_from_template(template: str, char: str) -> str:
+    """将标点模板 CSR 的 Content 文本替换为指定标点字符。
+
+    v1.5.0: 模板（CharacterStyle/句号）承载样式，但 Content 必须替换为
+    实际标点——旧实现直接复用模板的「。」文本，导致注入 ，、；：？！ 等
+    新标点时被错误写成句号。
+
+    模板可能是完整 CSR XML（旧句号 CSR 复用分支，逐标点复制整段模板）
+    或仅 <Content> 标签（拆分分支只取模板的 Content 部分），统一替换
+    首个 Content 的文本。对纯句号结果，替换后字节与旧实现完全一致。
+    """
+    return re.sub(
+        r'<Content>.*?</Content>',
+        _punct_content_tag(char),
+        template,
+        count=1,
+        flags=re.DOTALL,
+    )
 
 
 def _rebuild_paragraph_xml(
@@ -1249,7 +1379,8 @@ def _rebuild_paragraph_xml(
             break  # 找到第一个空+Br CSR，标记为紧邻尾饰
 
     # 4. 生成 CSR 级别的替换内容
-    # csr_replacements: {csr_idx: replacement_xml_string}
+    # csr_replacements: {csr_idx: replacement_xml_string | _DROP_CSR}
+    # （_DROP_CSR 表示该 CSR 整体删除，见分割副本 A3 分支）
     #
     # 无记录 CSR 的 Br 保留规则（优先级 A1→A2→A3→A3.5→A4）：
     #   A1. punct + trailing + 纯空白内容 + 有 Br → 保留（分隔符）
@@ -1314,10 +1445,14 @@ def _rebuild_paragraph_xml(
                     orig_csr, strip_groups=is_split_copy
                 )
             elif is_split_copy:
-                # A3: 分割副本 → 全部剥离
-                csr_replacements[ci] = _clear_content_strip_br(
-                    orig_csr, strip_groups=True
-                )
+                # A3: 分割副本 → 无记录空壳 CSR 直接删除（P3-14）。
+                # 原实现输出清空后的空壳（_clear_content_strip_br），分割段
+                # 数量大时（497 新句读结果 4317 个分割段）导致输出解压体积
+                # 膨胀 19 倍、验证阶段扫描 1.36GB 文本耗时 20 分钟以上。
+                # 空壳 CSR 无 Content/Br/Group（均已剥离），删除与保留的
+                # 渲染效果等价；含 ACE 指令的 CSR 已在上方 FIX-6 分支处理，
+                # 不会走到此处，ACE 内容不受影响。
+                csr_replacements[ci] = _DROP_CSR
             elif not is_leading and not is_trailing and has_br and orig_all_ws:
                 # A3.5: 中间区域（文字 CSR 之间）的空 + Br CSR → 保留
                 # 如偈颂前换行、段落内分行等排版需求
@@ -1347,7 +1482,13 @@ def _rebuild_paragraph_xml(
                 )
                 continue
             elif punct_template:
-                fill = ''.join(punct_template for _ in punct_segments)
+                # v1.5.0: 逐标点用模板生成 CSR，Content 替换为实际标点
+                # （旧实现 ''.join(punct_template ...) 会把 ，、？ 等
+                # 新标点错误写成模板里的「。」）
+                fill = ''.join(
+                    _punct_csr_from_template(punct_template, t)
+                    for t in punct_segments
+                )
                 if has_br:
                     # 模板可能无 Br → 在最后追加原 CSR 的 Br
                     br_match = re.search(r'<Br\s*/>', orig_csr)
@@ -1468,30 +1609,14 @@ def _rebuild_paragraph_xml(
                         '<AppliedFont type="string">思源宋体</AppliedFont>',
                         text_pfx,
                     )
-                    if punct_template:
-                        # 用 punct_template 的 Content 部分
-                        tmpl_content = re.search(
-                            r'<Content>.*?</Content>',
-                            punct_template, re.DOTALL
-                        )
-                        if tmpl_content:
-                            parts.append(
-                                text_pfx
-                                + tmpl_content.group(0)
-                                + clean_suffix
-                            )
-                        else:
-                            parts.append(
-                                text_pfx
-                                + f'<Content>。</Content>'
-                                + clean_suffix
-                            )
-                    else:
-                        parts.append(
-                            text_pfx
-                            + f'<Content>。</Content>'
-                            + clean_suffix
-                        )
+                    # v1.5.0: Content 统一用 _punct_content_tag(text) 生成
+                    # 实际标点（旧实现硬编码「。」或复用模板 Content，新标点
+                    # 会被错误写成句号）。模板只提供样式前缀 text_pfx。
+                    parts.append(
+                        text_pfx
+                        + _punct_content_tag(text)
+                        + clean_suffix
+                    )
                 else:
                     pfx = csr_prefix if i == non_punct_parts[0] else clean_prefix
                     parts.append(
@@ -1504,15 +1629,40 @@ def _rebuild_paragraph_xml(
             parts[-1] = parts[-1].replace(clean_suffix, csr_suffix)
             csr_replacements[ci] = ''.join(parts)
 
-    # 5. 应用替换：从后往前
-    result = original_psr_xml
-    for ci in range(len(csr_list) - 1, -1, -1):
-        cdata = csr_list[ci]
+    # 5. 应用替换：一次拼接（O(L)，P3-14 性能修复）
+    # 原实现从后往前逐个替换，每个替换都是 O(len) 切片+拼接，
+    # K 个替换 → O(K×L)。大经书（497）的 Story_u562 有 25 万 CSR、
+    # 单段最大 1.4MB、分割段 4300+，该写法触发二次方退化，单 Story
+    # 重建耗时数分钟（表现为生成输出进度条长时间停滞）。
+    # 所有 match 位置均基于 original_psr_xml 的原始偏移，一次拼接
+    # 即可正确应用全部替换（每个字符只复制一次）。
+    #
+    # 关键细节（P3-14 空壳删除）：
+    # - PSR 开标签与模板前缀（第一个 CSR 之前的内容）必须无条件保留，
+    #   否则第一个 CSR 被 _DROP_CSR 删除时开标签随之丢失（275 回归
+    #   出现"预期 9 段实际 8 段"）。
+    # - 被删 CSR（_DROP_CSR）仅跳过其自身原文区间，CSR 之间的
+    #   格式化空白（换行/缩进）与后续保留 CSR 的前置文本照常保留。
+    # - 替换为空串 '' 的 CSR（A1/A4 等旧行为）走正常保留分支，
+    #   效果是删除该 CSR 原文、前后文本直接相连，与原来一致。
+    first_csr_start = (csr_list[0]['match'].start()
+                       if csr_list else len(original_psr_xml))
+    psr_head = original_psr_xml[:first_csr_start]
+    parts: list[str] = [psr_head]
+    cursor = first_csr_start
+    for ci in range(len(csr_list)):
         if ci not in csr_replacements:
             continue
         repl = csr_replacements[ci]
-        match = cdata['match']
-        result = result[:match.start()] + repl + result[match.end():]
+        m = csr_list[ci]['match']
+        if repl is _DROP_CSR:
+            cursor = m.end()  # 跳过被删空壳 CSR 的原文区间
+            continue
+        parts.append(original_psr_xml[cursor:m.start()])
+        parts.append(repl)
+        cursor = m.end()
+    parts.append(original_psr_xml[cursor:])
+    result = ''.join(parts)
 
     return result
 
@@ -1741,6 +1891,17 @@ def generate_idml(
                     story_name = m.group(1)
                     story_idx, story = story_by_name[story_name]
                     meta = grouped_records.get(story_idx, {})
+                    # P3-14: 大 Story 重建耗时可达数分钟（如 497 的
+                    # Story_u562：71MB、581 原始段 + 4300+ 分割段）。
+                    # 重建前先给出状态消息，避免进度条长时间停滞被误认为
+                    # 程序卡死；TTY 下 \r 覆盖，非 TTY 下留一行日志。
+                    n_split = sum(
+                        1 for pi in meta if pi >= len(story['paragraphs'])
+                    )
+                    _log_progress(
+                        f"\r  写回 {story_name}  {_progress_bar(i - 1, n_total)}"
+                        f"  正在重建（{len(story['paragraphs'])} 原始段"
+                        f" + {n_split} 分割段）...")
                     new_xml, r_count, u_count, s_count = _rebuild_one_story(
                         story, story_idx, meta, split_sources,
                         global_punct_template,
@@ -1764,6 +1925,9 @@ def generate_idml(
                         f"\r  写回 {name} "
                         f"{_progress_bar(i, n_total)}")
         if n_total > 10:
+            # P3-14: 循环结束后强制显示 100%，避免进度条停留在
+            # (n-1) 处未收尾（原实现仅依赖 %10 节流更新）。
+            _log_progress(f"\r  写回完成  {_progress_bar(n_total, n_total)}")
             print()
         os.replace(tmp_path, output_path)
     except Exception:
@@ -1889,15 +2053,28 @@ def _verify_structure(
     # P2-5: 只检查 split_sources 指定的分割段落，而非遍历全部段落。
     # 分割段落在输出中的 PSR 索引 = 原段落 (orig_pi+1) 个 + 前面
     # orig_pi' < orig_pi 的同 Story 分割段落数（position = orig_pi+0.5 排序）。
-    for (si, new_pi), orig_pi in split_sources.items():
+    #
+    # P3-14: 原实现对每个分割段都重新 finditer 整个 Story XML（O(分割段数×
+    # 文本大小)）。497 的 Story_u562 有 4319 个分割段、输出解压 219MB，
+    # 该写法需重复扫描约 1TB 文本，验证阶段耗时 15 分钟以上（表现为
+    # [5/5] 验证输出长时间无反馈）。改为按 Story 分组缓存 PSR 列表：
+    # 每个 Story 只 finditer 一次（O(分割段数 + 文本大小)）。
+    psr_cache: dict[str, list] = {}
+    for (si, _new_pi), _orig_pi in split_sources.items():
         story_path = f'Stories/Story_{stories[si]["name"]}.xml'
         if story_path not in out_story_xmls:
             continue
-        xml = out_story_xmls[story_path]
-        psrs = list(re.finditer(
-            r'<ParagraphStyleRange[^>]*>.*?</ParagraphStyleRange>',
-            xml, re.DOTALL
-        ))
+        if story_path not in psr_cache:
+            psr_cache[story_path] = list(re.finditer(
+                r'<ParagraphStyleRange[^>]*>.*?</ParagraphStyleRange>',
+                out_story_xmls[story_path], re.DOTALL
+            ))
+
+    for (si, new_pi), orig_pi in split_sources.items():
+        story_path = f'Stories/Story_{stories[si]["name"]}.xml'
+        psrs = psr_cache.get(story_path)
+        if not psrs:
+            continue
         splits_of_story = sorted(
             (op, np) for (s, np), op in split_sources.items() if s == si
         )
@@ -1940,8 +2117,11 @@ def _verify_structure(
 
         story_path = f"Stories/Story_{story['name']}.xml"
         if story_path in out_story_xmls:
+            # P3-13: 统计口径与 _parse_story_xml 一致（配对段 + 自闭合段
+            # 各计 1 个），避免 footer 残留自闭合空段时开标签数与段落数漂移
             actual_total += len(re.findall(
-                r'<ParagraphStyleRange[^>]*>',
+                r'<ParagraphStyleRange[^>]*?/>'
+                r'|<ParagraphStyleRange[^>]*>.*?</ParagraphStyleRange>',
                 out_story_xmls[story_path], re.DOTALL
             ))
 
@@ -2041,7 +2221,7 @@ def _verify_output(
     # 构建输出字符序列：
     # - 跳过 Unicode 空白（_is_unicode_whitespace）
     # - 保留 U+3000（它在 _is_unicode_whitespace 中返回 False）
-    # - 保留所有可见字符和句号
+    # - 保留所有可见字符和标点（v1.5.0 起含白名单标点）
     # FIX-6: is_special 指令（ACE 等）单独收集核对，不混入正文字符序列
     output_chars: list[str] = []
     output_special: set[str] = set()
@@ -2135,8 +2315,13 @@ def process(idml_path, result_path, output_path, min_clean_chars: int = 50):
     print("\n[2/5] 读取句读结果...")
     result_data = extract_from_result(result_path)
     result_chars = result_data['chars']
-    punct_count = sum(1 for c in result_chars if c == '。')
-    print(f"  提取 {len(result_chars)} 个字符（含 {punct_count} 个句号）")
+    punct_counts = {p: result_chars.count(p) for p in _INJECTABLE_PUNCT}
+    punct_total = sum(punct_counts.values())
+    punct_breakdown = ' '.join(
+        f"{p}×{n}" for p, n in punct_counts.items() if n
+    )
+    print(f"  提取 {len(result_chars)} 个字符"
+          f"（含 {punct_total} 个标点 [{punct_breakdown}]）")
     if result_data['para_breaks']:
         print(f"  检测到 {len(result_data['para_breaks'])} 个段落边界")
 
@@ -2146,22 +2331,23 @@ def process(idml_path, result_path, output_path, min_clean_chars: int = 50):
     grouped_records = alignment['grouped']
     split_sources = alignment['split_sources']
 
-    # FIX-1C（P0）: 句号重合度预警 — 结果文件命名不含"句读结果"字样，
-    # 且句号数量与 IDML 原旧句号数量相差 <5% 时，疑似以原文导出文本当结果。
-    # （修复 B 已拦截含非句号旧标点的文件；此处兜底纯句号原文的漏网场景）
-    idml_dot_count = sum(
+    # FIX-1C（P0）: 标点重合度预警 — 结果文件命名不含"句读结果"字样，
+    # 且标点数量与 IDML 原旧标点数量相差 <5% 时，疑似以原文导出文本当结果。
+    # （修复 B 已拦截含白名单外标点的文件；此处兜底纯句号原文的漏网场景）
+    # v1.5.0: 统计口径从仅句号扩展为全部白名单标点。
+    idml_punct_count = sum(
         1 for story in stories for para in story['paragraphs']
-        for rec in para['chars'] if rec['char'] == '。'
+        for rec in para['chars'] if rec['char'] in _INJECTABLE_PUNCT
     )
-    result_dot_count = sum(1 for c in result_chars if c == '。')
+    result_punct_count = sum(1 for c in result_chars if c in _INJECTABLE_PUNCT)
     result_base = os.path.basename(result_path)
-    if "句读结果" not in result_base and idml_dot_count > 0:
-        dot_diff_ratio = abs(idml_dot_count - result_dot_count) / idml_dot_count
-        if dot_diff_ratio < 0.05:
+    if "句读结果" not in result_base and idml_punct_count > 0:
+        punct_diff_ratio = abs(idml_punct_count - result_punct_count) / idml_punct_count
+        if punct_diff_ratio < 0.05:
             print(
                 f"\n[!] 警告: 结果文件「{result_base}」命名不含「句读结果」字样，"
-                f"且其句号数量（{result_dot_count}）与 IDML 原旧句号"
-                f"（{idml_dot_count}）高度重合（差异 {dot_diff_ratio*100:.1f}% < 5%），"
+                f"且其标点数量（{result_punct_count}）与 IDML 原旧标点"
+                f"（{idml_punct_count}）高度重合（差异 {punct_diff_ratio*100:.1f}% < 5%），"
                 f"疑似以原文导出文本冒充句读结果，请人工确认后重跑。")
 
     # Step 4: 生成输出
