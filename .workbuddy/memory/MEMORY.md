@@ -2,8 +2,15 @@
 
 ## 代码版本与备份惯例
 - 每次修复先备份 `code/inject.py` 到 `backup/inject.py.v{版本}-{说明}-{日期}.bak`
-- 当前版本：v1.5.3（括号+几何符号保留，2026-08-07）
+- 当前版本：v1.5.4（GUI 三项改造：输出目录选择/批量确认列表/批量不卡顿，2026-08-07）
 - 修复编号沿用 fix-plan-2026-08-04.md 的 P0-P3 体系
+
+## P3-15 GUI 日志与线程知识（重要，防复发）
+- **GUI 无响应根因**（批量处理大文件时）：旧 `_poll_queue` 的 `while True` 一次性全量消费日志队列 → 主线程长时间忙于 insert/see('end')，无法处理窗口消息 → Windows 判定「未响应」；且 `_log_progress` 的 `\r` 进度行在 Tk 文本控件中显示为换行，ScrolledText 无限膨胀、see('end') 越来越慢（恶性循环）
+- **修复机制**（gui_inject.py，改 GUI 必须遵守）：① 节流 `POLL_BATCH=200`——每次 poll 最多消费 200 条，批量拼接后只调一次 `_log`，主线程每 100ms 必返回事件循环；② worker 结束用 `threading.Event` 置位 + `_drain_tail` 收尾（DONE 标记不被节流延迟）；③ `_log` 里 `\r` 清理 + 行数上限 `MAX_LOG_LINES=5000`（超出删除最前面行）；④ 主线程调用含 print 的逻辑（如 find_pairs）前必须临时换 NullWriter——Nuitka 打包（--windows-console-mode=disable）后 sys.stdout 为 None，print 抛 AttributeError
+- **验证**：2 万条含 \r 日志风暴 0.5s 完成、行数裁剪 5001、收尾正常；批量核心逻辑在模块级纯函数 `run_batch_process(base_dir, out_dir, pairs)`（可单测，每文件前打印 `[i/n] 经号 x`）
+- **GUI 交互流程**：单文件输出走「目录…」（askdirectory + simpledialog.askstring 改文件名，默认 `{IDML名}_WD注入.idml`）；批量选目录后先弹确认窗口（输出目录可改 + Treeview 待处理列表），确认才处理
+- 打包 venv：`C:\Users\Admin\.workbuddy\binaries\python\envs\pack312`（Nuitka 4.1.3 / Python 3.12.10）；managed Python 3.13 无 tkinter，测试用系统 Python 3.12.10
 
 ## v1.5.3 保留排版符号知识（重要，防复发）
 - **范围**：成对符号 `_KEEP_BRACKETS`（（）()〔〕《》〈〉「」『』【】〖〗［］）+ 几何装饰符号 `_KEEP_ORNAMENTS`（■□△▲○●◇◆ 及变体/星/※，约 30 个）；统一入口 `_is_keep_symbol`
