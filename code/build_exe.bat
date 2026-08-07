@@ -26,8 +26,8 @@ cd /d "%~dp0"
     --onefile-tempdir-spec="{TEMP}/jd_onefile_{PID}_{TIME_US}" ^
     --output-dir="%~dp0..\dist" ^
     --product-name="IDML句读回注工具" ^
-    --product-version="1.5.4" ^
-    --file-description="IDML 句读结果回注工具（图形界面 + 拖拽命令行）" ^
+    --product-version="1.5.5" ^
+    --file-description="IDML 句读结果回注工具（图形界面 + 拖拽命令行 + 窗口拖拽）" ^
     --output-filename="IDML句读回注工具.exe" ^
     launcher.py
 

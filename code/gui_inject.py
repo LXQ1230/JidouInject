@@ -16,7 +16,6 @@ UI 无响应），保证 Tk 界面线程安全。
 import io
 import os
 import queue
-import re
 import sys
 import threading
 import time
@@ -30,11 +29,12 @@ if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
 import inject  # noqa: E402  （同目录核心库）
+from drag_input import classify_paths, find_pairs_in_dir  # noqa: E402  （拖拽解析共用）
 
-APP_TITLE = "IDML 句读回注工具 v1.5.4"
+APP_TITLE = "IDML 句读回注工具 v1.5.5"
 
 # 测试/演练文件模式：批量配对时必须排除，防止把测试产物当正式输入
-_TEST_PATTERNS: tuple[str, ...] = ('_old_test', '_test')
+# （口径统一于 drag_input.is_excluded_input）
 
 # P3-15: GUI 无响应修复 — 日志消费节流与上限
 # 根因：批量处理时 worker 线程持续产生日志，旧实现 _poll_queue 的
@@ -46,88 +46,7 @@ MAX_LOG_LINES: int = 5000  # 日志区最大行数，超出删除最前面的行
 
 
 # ─────────────────────────── 纯逻辑（不依赖 Tk，可单测） ───────────────────────────
-
-def _extract_number(filename: str) -> str | None:
-    """从文件名中提取开头的经号（数字）。"""
-    m = re.match(r'^(\d+)', filename)
-    return m.group(1) if m else None
-
-
-def _is_excluded_test_file(f: str) -> bool:
-    """判断文件名是否属于测试/演练产物（*_old_test* / *_test*）。"""
-    return any(p in f for p in _TEST_PATTERNS)
-
-
-def find_pairs_in_dir(base_dir: str) -> list[tuple[str, str, str]]:
-    """按经号配对 IDML 与句读结果（参数化版，参考 batch_inject.find_pairs）。
-
-    规则（与批处理脚本保持一致）：
-    - IDML：*.idml（排除 _WD注入 输出与测试文件）
-    - 句读结果：*.md / *.txt（凡放入即视为结果，排除 _WD注入 与测试文件）
-    - 配对：文件名开头数字（经号）相同即为一对；多文件时 IDML 含「导出」优先，
-      结果按文件名排序取第一个。
-
-    Returns:
-        [(idml绝对路径, 结果绝对路径, 经号), ...]
-    """
-    if not os.path.isdir(base_dir):
-        raise FileNotFoundError(f"目录不存在: {base_dir}")
-
-    all_files = os.listdir(base_dir)
-    idml_by_number: dict[str, list[str]] = {}
-    md_by_number: dict[str, list[str]] = {}
-
-    for f in all_files:
-        if f.endswith('.idml') and '_WD注入' not in f \
-                and not _is_excluded_test_file(f):
-            num = _extract_number(f)
-            if num is None:
-                print(f"警告: {f} 文件名无经号，跳过")
-                continue
-            idml_by_number.setdefault(num, []).append(f)
-
-    for f in all_files:
-        if (f.endswith('.md') or f.endswith('.txt')) \
-                and '_WD注入' not in f \
-                and not _is_excluded_test_file(f):
-            num = _extract_number(f)
-            if num is None:
-                print(f"警告: {f} 文件名无经号，跳过")
-                continue
-            md_by_number.setdefault(num, []).append(f)
-
-    pairs: list[tuple[str, str, str]] = []
-    for num in sorted(idml_by_number):
-        idml_list = idml_by_number[num]
-        md_list = md_by_number.get(num, [])
-
-        if not md_list:
-            print(f"警告: 经号 {num} 找不到对应句读结果，跳过")
-            continue
-
-        if len(idml_list) > 1:
-            pref = [f for f in idml_list if '导出' in f]
-            idml_chosen = (pref or sorted(idml_list))[0]
-            print(f"警告: 经号 {num} 有多个 IDML 文件 ({idml_list})，"
-                  f"优先选择: {idml_chosen}")
-        else:
-            idml_chosen = idml_list[0]
-
-        if len(md_list) > 1:
-            md_chosen = sorted(md_list)[0]
-            print(f"警告: 经号 {num} 有多个候选结果文件 ({md_list})，"
-                  f"优先选择: {md_chosen}")
-        else:
-            md_chosen = md_list[0]
-
-        pairs.append((
-            os.path.join(base_dir, idml_chosen),
-            os.path.join(base_dir, md_chosen),
-            num,
-        ))
-
-    return pairs
-
+# find_pairs_in_dir 等配对逻辑已迁移至 drag_input.py（两处拖拽共用，口径唯一）
 
 def check_idml_valid(idml_path: str) -> str | None:
     """校验 IDML 文件有效性，返回错误消息（None 表示通过）。"""
@@ -253,17 +172,23 @@ class InjectApp:
         self.output_var = tk.StringVar()
         self.status_var = tk.StringVar(value="就绪")
         self.busy = False
+        self._drag_pending: list[str] = []   # 窗口拖拽累积袋（支持分次补拖）
 
         self._build_ui()
         self._log(
             "欢迎使用 IDML 句读回注工具\n"
             "────────────────────────────────────────────\n"
-            "使用方式一（拖拽）：把 IDML 文件与句读结果文件同时拖到本程序\n"
-            "  图标上，自动进入命令行回注模式。\n"
+            "使用方式一（拖拽）：把 IDML 文件、句读结果文件或文件夹\n"
+            "  拖到本窗口内（也可拖到 exe 图标上）自动识别并载入。\n"
+            "  支持：两个文件（顺序不限）、单个 IDML 自动找结果、\n"
+            "  多对文件、整个文件夹（按经号配对批量）。\n"
             "使用方式二（界面）：下方选择文件后点「开始回注」；\n"
             "  或点「批量处理…」选择文件夹，确认待处理列表后自动配对处理。\n"
             "────────────────────────────────────────────\n"
         )
+
+        # 窗口内拖拽（纯 ctypes + WM_DROPFILES；失败静默降级，不影响使用）
+        self._drag_helper = _DragDropHelper(self)
 
     # ── 界面构建 ──
     def _build_ui(self) -> None:
@@ -330,6 +255,60 @@ class InjectApp:
             filetypes=[("文本文件", "*.md *.txt"), ("所有文件", "*.*")])
         if path:
             self.result_var.set(path)
+
+    # ── 窗口拖拽（WM_DROPFILES → handle_dropped_paths） ──
+    def handle_dropped_paths(self, paths: list[str]) -> None:
+        """窗口内释放文件后的统一处理（供 _DragDropHelper 回调与单测直接调用）。
+
+        支持多次拖入累积（pending 袋）：先拖 IDML、再拖结果可分两次完成；
+        成对后自动清空。busy 时忽略拖入。
+        """
+        if self.busy:
+            self._log("处理中，已忽略拖入的文件。\n")
+            return
+
+        self._drag_pending.extend(paths)
+        try:
+            plan = classify_paths(self._drag_pending)
+        except Exception as e:
+            self._log(f"拖拽内容解析失败: {e}\n")
+            return
+
+        for m in plan.messages:
+            self._log(f"  {m}\n")
+
+        if plan.mode == 'single':
+            self.idml_var.set(plan.idml)
+            self.result_var.set(plan.result)
+            self._drag_pending.clear()
+            self.status_var.set("已从拖拽载入（点「开始回注」执行）")
+            self._log(f"\n已从拖拽载入：\n  IDML: {os.path.basename(plan.idml)}\n"
+                      f"  句读结果: {os.path.basename(plan.result)}\n"
+                      "请核对后点「开始回注」。\n")
+
+        elif plan.mode == 'single_need_result':
+            self.idml_var.set(plan.idml)
+            self.status_var.set("请再拖入句读结果，或点「浏览…」选择")
+            self._log(f"\n已载入 IDML: {os.path.basename(plan.idml)}\n"
+                      "未找到对应句读结果。请再拖入句读结果文件，"
+                      "或点「浏览…」手动选择。\n")
+
+        elif plan.mode == 'batch':
+            base_dir = plan.base_dir or os.path.dirname(plan.pairs[0][0])
+            self._drag_pending.clear()
+            self.status_var.set("拖入批量内容，请核对列表")
+            self._show_batch_confirm(base_dir, plan.pairs)
+
+        else:  # error
+            self.status_var.set("拖入内容无法识别")
+            self._log("拖入内容无法识别，请检查：\n")
+            for m in plan.messages:
+                self._log(f"  {m}\n")
+            messagebox.showwarning(
+                "拖入内容无法识别",
+                "未能从拖入的内容识别出可处理的文件对。\n"
+                "请拖入 IDML 文件（.idml）、句读结果（.md/.txt）或文件夹。\n\n"
+                + "\n".join(plan.messages[:5]))
 
     def _pick_output(self) -> None:
         """选择输出目录；随后弹出文件名输入框（默认「{IDML名}_WD注入.idml」），
@@ -636,6 +615,104 @@ class InjectApp:
             self.log_text.delete('1.0', f'{line_count - MAX_LOG_LINES}.0')
         self.log_text.see('end')
         self.log_text.configure(state='disabled')
+
+
+# ─────────────────────────── 窗口内拖拽（纯 ctypes + WM_DROPFILES） ───────────────────────────
+
+class _DragDropHelper:
+    """窗口内文件拖拽（Windows 原生 WM_DROPFILES，零第三方依赖）。
+
+    实现：子类化 Tk 顶层窗口的 WndProc 接收 WM_DROPFILES 消息，
+    用 DragQueryFileW（宽字符，中文路径无乱码）枚举全部释放路径，
+    经 root.after(0, ...) 抛到 Tk 主线程后交给 app.handle_dropped_paths。
+
+    取舍（方案 v1.5.5）：WM_DROPFILES 是「释放即回调」机制，拖入过程中
+    无预览高亮（DragEnter 反馈需 OLE IDropTarget，复杂度高，留待后续）。
+
+    失败策略：初始化异常/非 Windows 时静默降级（拖拽不可用不影响 GUI 其他功能）。
+    """
+
+    WM_DROPFILES = 0x0233
+    GWLP_WNDPROC = -4
+
+    def __init__(self, app) -> None:
+        self.app = app
+        self._hwnd = None
+        self._old_wndproc = None
+        self._new_wndproc = None  # 强引用防 GC（子类化回调必须存活）
+        self._attach(app.root)
+
+    def _attach(self, root) -> None:
+        if os.name != 'nt':
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            shell32 = ctypes.windll.shell32
+            raw_hwnd = root.winfo_id()
+            if not raw_hwnd:
+                return
+            # 取顶层窗口句柄（winfo_id 返回 wrapper，GA_ROOT 兜底）
+            user32.GetAncestor.restype = wintypes.HWND
+            hwnd = user32.GetAncestor(raw_hwnd, 2) or raw_hwnd
+            self._hwnd = hwnd
+
+            WNDPROC = ctypes.WINFUNCTYPE(
+                ctypes.c_ssize_t, wintypes.HWND, ctypes.c_uint,
+                wintypes.WPARAM, wintypes.LPARAM)
+
+            def _wndproc(h, msg, wp, lp):
+                if msg == self.WM_DROPFILES:
+                    paths = self._query_files(wp)
+                    if paths:
+                        root.after(0, lambda: self.app.handle_dropped_paths(paths))
+                if self._old_wndproc is not None:
+                    return self._old_wndproc(h, msg, wp, lp)
+                return 0
+
+            self._new_wndproc = WNDPROC(_wndproc)
+            # SetWindowLongPtrW 必须显式声明类型（默认 c_int 会截断 64 位指针；
+            # WINFUNCTYPE 实例需经 c_void_p 转换才能传参）
+            user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+            user32.SetWindowLongPtrW.argtypes = [
+                wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+            old = user32.SetWindowLongPtrW(
+                hwnd, self.GWLP_WNDPROC,
+                ctypes.cast(self._new_wndproc, ctypes.c_void_p))
+            if not old:
+                self._new_wndproc = None
+                return
+            self._old_wndproc = ctypes.cast(old, WNDPROC)
+            # 拖拽相关 Win32 函数位于 shell32.dll（DragAcceptFiles/DragQueryFile/DragFinish）
+            shell32.DragAcceptFiles(hwnd, True)
+        except Exception as e:  # noqa: BLE001  （降级：拖拽不可用不影响 GUI）
+            self._hwnd = None
+            self._old_wndproc = None
+            self._new_wndproc = None
+            print(f"[拖拽] 窗口拖拽初始化失败（不影响使用）: {e}")
+
+    def _query_files(self, hdrop) -> list[str]:
+        """枚举 HDROP 中的全部文件路径（宽字符）并释放资源。"""
+        import ctypes
+        from ctypes import wintypes
+
+        shell32 = ctypes.windll.shell32
+        # 声明类型防 64 位 HDROP 指针被默认 c_int 截断
+        shell32.DragQueryFileW.restype = ctypes.c_uint
+        shell32.DragQueryFileW.argtypes = [
+            wintypes.HANDLE, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint]
+        shell32.DragFinish.argtypes = [wintypes.HANDLE]
+        n = shell32.DragQueryFileW(hdrop, -1, None, 0)
+        paths: list[str] = []
+        for i in range(n):
+            buf_len = shell32.DragQueryFileW(hdrop, i, None, 0)
+            buf = ctypes.create_unicode_buffer(buf_len + 1)
+            shell32.DragQueryFileW(hdrop, i, buf, buf_len + 1)
+            paths.append(buf.value)
+        shell32.DragFinish(hdrop)
+        return paths
 
 
 def run() -> int:
