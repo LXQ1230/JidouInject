@@ -2,8 +2,19 @@
 
 ## 代码版本与备份惯例
 - 每次修复先备份 `code/inject.py` 到 `backup/inject.py.v{版本}-{说明}-{日期}.bak`
-- 当前版本：v1.5.4（GUI 三项改造：输出目录选择/批量确认列表/批量不卡顿，2026-08-07）
+- 当前版本：v1.5.5（拖拽增强：图标拖拽全形态 + 窗口内拖拽 WM_DROPFILES，2026-08-07）
 - 修复编号沿用 fix-plan-2026-08-04.md 的 P0-P3 体系
+
+## v1.5.5 拖拽知识（重要，防复发）
+- **架构**：`code/drag_input.py` 拖拽解析纯逻辑（图标拖拽 launcher.py 与窗口拖拽 gui_inject.py 共用，口径唯一）：`classify_paths(paths)→DragPlan`（single/single_need_result/batch/error，扩展名分类=顺序自适应）、`find_result_for_idml`（同名→同经号两级）、`find_pairs_in_dir`（自 gui_inject 迁移）、`is_excluded_input`（测试模式+_WD注入）
+- **launcher.py**：显式 `--idml/--result` 走 legacy inject.main()（交互式冲突）；拖拽 single 走 run_cli **去交互化**（直接 inject.process + 冲突自动 _v2，绝不覆盖）；batch 复用 `run_batch_process`（out_dir=首个 IDML 目录/output）；need_result 用 `tk.Tk().withdraw()+askopenfilename` 弹窗；文件夹 1 对降级 single（输出同目录），≥2 对 batch（输出 output/）
+- **窗口拖拽（gui_inject.py `_DragDropHelper`）纯 ctypes + WM_DROPFILES 零依赖**：
+  - **Win32 拖拽函数在 shell32.dll 不在 user32.dll**（DragAcceptFiles/DragQueryFileW/DragFinish）
+  - **ctypes 64 位指针必须显式声明类型**：SetWindowLongPtrW argtypes=[HWND,c_int,c_void_p]（WINFUNCTYPE 实例 cast 成 c_void_p）、restype=c_ssize_t；DragQueryFileW hdrop 参数 HANDLE；GlobalLock/SendMessageW 同理——否则 64 位指针截断/溢出
+  - 子类化 WndProc：新 wndproc 强引用防 GC；消息透传原 wndproc；拖拽回调经 `root.after(0)` 抛主线程（不破坏 P3-15 节流模型）；失败静默降级不影响 GUI
+  - GUI 支持多次拖入累积（`self._drag_pending` 袋）：先拖 IDML 再拖结果两次完成；busy 忽略
+- **冒烟技巧**（code/_smoke_dnd.py）：SendMessage 构造 HDROP 模拟真实拖拽——DROPFILES 结构（20 字节：pFiles+pt+fNC+fWide）+ UTF-16LE 路径序列；**路径 NULL 终止符 2 字节 \x00\x00**（只加 1 字节后续路径奇数偏移错位成乱码）；DragFinish 在 wndproc 内释放 hdrop，勿再 GlobalFree；GlobalAlloc/Lock/Unlock/SendMessageW 全要声明类型
+- 回归：test_drag_input.py（15 项）+ _smoke_dnd.py（4 场景）+ test_gui_logic.py；打包 venv pack312
 
 ## P3-15 GUI 日志与线程知识（重要，防复发）
 - **GUI 无响应根因**（批量处理大文件时）：旧 `_poll_queue` 的 `while True` 一次性全量消费日志队列 → 主线程长时间忙于 insert/see('end')，无法处理窗口消息 → Windows 判定「未响应」；且 `_log_progress` 的 `\r` 进度行在 Tk 文本控件中显示为换行，ScrolledText 无限膨胀、see('end') 越来越慢（恶性循环）
