@@ -136,7 +136,10 @@ def main():
                 if not content_m:
                     continue
                 c = content_m.group(1)
-                if c in PUNCTS and c != '。':
+                # v1.5.1-Br: 空串也满足 `c in PUNCTS`（子串判定），
+                # 修复 1 保留的空+Br CSR（原文旧句号分行符）会被误判为
+                # 非思源宋体标点。必须排除空 Content。
+                if c and c in PUNCTS and c != '。':
                     punct_csrs += 1
                     if '思源宋体' not in m.group(2):
                         non_sy_csrs += 1

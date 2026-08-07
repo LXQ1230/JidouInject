@@ -8,9 +8,14 @@ IDML 句读结果回注工具
     python inject.py --idml 275导出.idml --result 275从ID中导出文字_WD句读结果.md
     或拖拽两个文件到 inject.bat 上
 
-版本: v1.5.0（2026-08-06 标点开放）— 回注标点从仅「。」扩展为
-_INJECTABLE_PUNCT（，、；：？！。），抑制规则对新标点一视同仁，
-样式沿用 CharacterStyle/句号 模板、Content 替换为实际标点。
+版本: v1.5.3（2026-08-07 括号+几何符号保留）— 成对符号（（）〔〕等）
+与几何装饰符号（■□◎◇▲△○ 等字间镶嵌）在解析时标记 is_bracket、
+对齐时等同空白（不消费 txt）、重建时 Content 原样保留（20 号校勘注
+9 对全角圆括号 + 正文 7 个几何符号零丢失；3093 龟甲括号零丢失）。
+txt 中白名单外标点仍拒绝（FIX-1B 不变）。
+（v1.5.2 方案 C：文字 CSR 末尾标点转移进后邻旧句号 CSR 自身模板复用，
+消除逐字拆分导致的体积膨胀与排版异常；v1.5.0 将回注标点扩展为
+_INJECTABLE_PUNCT（，、；：？！。）。）
 """
 
 import sys
@@ -42,6 +47,7 @@ class CharRecord:
     csr_idx: int
     content_slot: int
     font: str | None = None       # 解析阶段有；对齐阶段记录无
+    is_bracket: bool = False      # 保留的排版符号（成对符号+几何装饰，v1.5.3）
     after_csr: int = -1           # 仅对齐阶段句号记录使用
     after_slot: int | None = None # 仅对齐阶段句号记录使用
     slot_pos: int = 0             # 字符在 content_slot 内的偏移（解析阶段）
@@ -136,6 +142,65 @@ def _is_old_punct(ch: str) -> bool:
     if len(ch) != 1:
         return False
     return ch in _OLD_PUNCT_CHARS
+
+
+# v1.5.3 成对符号白名单（问题 1：括号保留）— 回注时保留 IDML 原位置的
+# 成对符号。IDML 原文含「（）」等排版装饰符号，txt 句读结果对应位置没有
+# 这些符号；它们不属于句读结果，回注后应原样保留在原文位置。
+# 项目实测（86 个 IDML 全量扫描）：全角圆括号 54（20 号藏本校勘注
+# 「（甯）（磧）（清）（大）…」）、龟甲括号 16（3093「慈〔云〕懴主」），
+# 其他符号（书名号/引号/方括号等）在当前文件中未出现——白名单按计划
+# 5.2/5.3 常见组默认启用，未来遇到新符号再按需扩展。
+#
+# 注意：半角尖括号 < > 不在此列——它们是 ACE 字形加工指令
+# `<?ACE N?>` 的组成部分，已在 FIX-6 单独处理（964 个误报来源）。
+_KEEP_BRACKETS: frozenset[str] = frozenset(
+    '（）()〔〕《》〈〉「」『』【】〖〗［］'
+)
+
+
+def _is_keep_bracket(ch: str) -> bool:
+    """判断字符是否为应保留的成对符号（括号/书名号/引号等排版装饰）。"""
+    if len(ch) != 1:
+        return False
+    return ch in _KEEP_BRACKETS
+
+
+# v1.5.3 几何装饰符号白名单（20 号实测：■□◎◇▲△○ 嵌于正文字间，
+# 「如■是□我◎聞一◇時佛▲住△…」为字间镶嵌排版装饰；用户确认按
+# 「常见几何符号全集」扩展）。与成对符号同机制：解析标记 is_bracket、
+# 对齐等同空白（不消费 txt）、重建 Content 原样保留。
+# 注意：半角尖括号 < > 不在此列——它们是 ACE 指令 `<?ACE N?>` 组成部分。
+_KEEP_ORNAMENTS: frozenset[str] = frozenset(
+    # 基础几何（U+25A0-25CB）：方块/三角/圆/菱形
+    '■□△▲○●◇◆'
+    # 方块变体（U+25A2-25AF）
+    '▢▣▤▥▦▧▨▩▪▫▬▭▮▯'
+    # 三角/箭头变体（U+25B4-25C5）
+    '▴▵▷▸▹►▻▽▾▿◀◁◂◃◄◅'
+    # 圆/菱形/靶心变体（U+25C8-25D7）
+    '◈◉◊○◌◍◎●◐◑◒◓◔◕◖◗'
+    # 星形与参考标记
+    '★☆✦✧※'
+)
+
+
+def _is_keep_ornament(ch: str) -> bool:
+    """判断字符是否为应保留的几何装饰符号（■□◎◇▲△○ 等字间镶嵌）。"""
+    if len(ch) != 1:
+        return False
+    return ch in _KEEP_ORNAMENTS
+
+
+def _is_keep_symbol(ch: str) -> bool:
+    """判断字符是否为应保留的排版符号（成对符号 + 几何装饰符号）。
+
+    v1.5.3 统一入口：解析标记、比对排除、对齐跳过的唯一判定点。
+    语义 = 原文排版装饰，不属于句读结果，回注后原样保留。
+    """
+    if len(ch) != 1:
+        return False
+    return ch in _KEEP_BRACKETS or ch in _KEEP_ORNAMENTS
 
 
 # 可回注标点白名单（v1.5.0）— 句读结果中允许出现、并可注入回 IDML 的标点。
@@ -414,10 +479,19 @@ def _is_ws_for_compare(ch: str) -> bool:
     与 _is_unicode_whitespace() 不同，此函数将 U+3000（全角空格）也视为空白。
     比对和字符对齐时使用，确保句读结果中的空格差异不影响文字匹配。
     IDML 原文中的空格原样保留在输出中。
+
+    v1.5.3: 成对符号与几何装饰符号（_is_keep_symbol，含（）〔〕■□◎◇▲△
+    等）也视为"空白"——对齐时不消费 txt 字符（txt 句读结果不含这些
+    排版符号）、字体查找时跳过、比对时排除。IDML 原文的符号通过对齐
+    while 的空白分支作为文字记录保留，重建时 Content 原样输出
+    （见 _parse_paragraph_style_range 的 is_bracket 标记与
+    validate_and_align 的 ws 分支）。
     """
     if _is_unicode_whitespace(ch):
         return True
     if ord(ch) == 0x3000:
+        return True
+    if _is_keep_symbol(ch):
         return True
     return False
 
@@ -905,9 +979,15 @@ def _parse_paragraph_style_range(
                 continue
 
             for pos, ch in enumerate(content_text):
+                is_brk = _is_keep_symbol(ch)
                 chars.append(CharRecord(
                     char=sys.intern(ch),
-                    is_punct=_is_old_punct(ch),
+                    # v1.5.3: 成对符号与几何装饰符号（（）〔〕■□◎◇▲△ 等）
+                    # 不是旧标点——is_punct=False（参与重建保留）+
+                    # is_bracket=True（不参与句读匹配/统计，
+                    # 见 _is_ws_for_compare）
+                    is_punct=(_is_old_punct(ch) and not is_brk),
+                    is_bracket=is_brk,
                     is_special=False,
                     story_idx=story_idx,
                     para_idx=para_idx,
@@ -1043,6 +1123,10 @@ def validate_and_align(
             1 for para in story['paragraphs']
             for rec in para['chars']
             if not rec['is_punct'] and not rec.get('is_special', False)
+            # v1.5.3: 成对符号（is_bracket）不参与正文判定——
+            # 否则含括号的装饰 Story（如页眉「佛說離垢施女經」）可能
+            # 被误判为正文参与对齐
+            and not rec.get('is_bracket', False)
             and not _is_unicode_whitespace(rec['char'])
         )
         if story_clean_count < min_clean_chars:
@@ -1193,10 +1277,14 @@ def validate_and_align(
                     last_slot = (orig_rec['story_idx'], orig_rec['para_idx'],
                                  orig_rec['csr_idx'], orig_rec['content_slot'],
                                  orig_rec.get('slot_pos', 0))
+                    # v1.5.3: 该分支同时承接 U+3000 与成对符号（is_bracket）——
+                    # 括号不消费 txt 字符、作为文字记录保留（重建时 Content
+                    # 原样输出）。is_bracket 标记延续，供统计/验证使用。
                     new_records.append(CharRecord(
                         char=orig_rec['char'],
                         is_punct=False,
                         is_special=False,
+                        is_bracket=orig_rec.get('is_bracket', False),
                         story_idx=orig_rec['story_idx'],
                         para_idx=effective_pi,
                         csr_idx=orig_rec['csr_idx'],
@@ -1272,6 +1360,32 @@ def _punct_csr_from_template(template: str, char: str) -> str:
     return re.sub(
         r'<Content>.*?</Content>',
         _punct_content_tag(char),
+        template,
+        count=1,
+        flags=re.DOTALL,
+    )
+
+
+def _punct_csr_from_own_template(template: str, char: str) -> str:
+    """基于 CSR 自身模板生成标点 CSR（v1.5.2 方案 C）。
+
+    旧句号 CSR 复用分支不再使用全局 punct_template（丢失各 CSR 自身
+    PointSize/FillColor/Br），改用 CSR 自身模板：
+    - 优先替换含「。」的 Content（旧句号 CSR 的句号文本）
+    - 无「。」则替换第一个非空 Content
+    - 其余标签（含 Br）原样保留——单标点替换后 Br 自然保留
+    """
+    punct_content = _punct_content_tag(char)
+    m = re.search(r'<Content>[^<]*。</Content>', template, re.DOTALL)
+    if m:
+        return template[:m.start()] + punct_content + template[m.end():]
+    m = re.search(r'<Content>\s*[^<]*\s*</Content>', template, re.DOTALL)
+    if m:
+        return template[:m.start()] + punct_content + template[m.end():]
+    # 回退：替换第一个 Content（空 Content 或含指令的 Content）
+    return re.sub(
+        r'<Content>.*?</Content>',
+        punct_content,
         template,
         count=1,
         flags=re.DOTALL,
@@ -1378,6 +1492,49 @@ def _rebuild_paragraph_xml(
             first_trailing_decoration = ci
             break  # 找到第一个空+Br CSR，标记为紧邻尾饰
 
+    # 3.7 v1.5.2 方案 C：末尾标点重分配（主路径）
+    # 对齐逻辑把 txt 标点分配给"它跟随的文字 CSR"（after_csr），使文字 CSR
+    # 内部有标点 → 走拆分路径 → 逐字拆分（35 号混合版输出膨胀 2.73 倍 +
+    # 「時、離垢施」换行异常，根因见 plan-csr-reuse-and-brackets-2026-08-07.md）。
+    # 原始 IDML 中文字 CSR 后几乎都紧跟一个旧句号 CSR（CharacterStyle/句号），
+    # txt 标点与旧句号位置重合时，把标点转移进旧句号 CSR——文字 CSR 零改动
+    # （走"不拆分合并"路径原样重建），旧句号 CSR 复用自身模板（改动点 2）。
+    # 条件：标点位于 CSR 最后文字字符之后（槽位 == last_slot 且 after_pos
+    # 不早于槽位末尾偏移），且后邻 CSR 是 segments 为空的旧句号 CSR。
+    # 注意：对齐后文字记录的 slot_pos 恒为 0（CharRecord 默认值，重建从未
+    # 使用），槽位末尾偏移须用原始 Content 长度计算（len-1）。
+    for ci in sorted(csr_segments.keys()):
+        cdata = csr_list[ci]
+        if cdata['is_punct']:
+            continue
+        segs = csr_segments[ci]
+        last_slot: int | None = None
+        for is_p, _t, slot, _pos in segs:
+            if not is_p and slot is not None:
+                last_slot = slot
+        if last_slot is None:
+            continue
+        orig_contents = cdata.get('contents', [])
+        if last_slot >= len(orig_contents) or not orig_contents:
+            continue
+        slot_last_pos = max(0, len(orig_contents[last_slot]) - 1)
+        trailing_idx = [
+            i for i, s in enumerate(segs)
+            if s[0] and s[2] == last_slot and (s[3] or 0) >= slot_last_pos
+        ]
+        if not trailing_idx:
+            continue
+        nxt = ci + 1
+        if nxt >= len(csr_list) or not csr_list[nxt]['is_punct']:
+            continue
+        if csr_segments.get(nxt):
+            continue  # 后邻旧句号 CSR 已有记录（含文字等）→ 不转移
+        trail_set = set(trailing_idx)
+        csr_segments[ci] = [
+            s for i, s in enumerate(segs) if i not in trail_set
+        ]
+        csr_segments[nxt] = [segs[i] for i in trailing_idx]  # 多标点保持原顺序
+
     # 4. 生成 CSR 级别的替换内容
     # csr_replacements: {csr_idx: replacement_xml_string | _DROP_CSR}
     # （_DROP_CSR 表示该 CSR 整体删除，见分割副本 A3 分支）
@@ -1432,8 +1589,17 @@ def _rebuild_paragraph_xml(
                 continue
 
             if is_punct:
-                # A1: 尾随 punct 分隔符（原始纯空白内容）→ 保留 Br
-                if has_br and is_trailing and orig_all_ws:
+                # A1: 无记录旧句号 CSR（旧标点已被清除，无新标点分配到它）。
+                # v1.5.1-Br 修复: 中间/trailing 位置带 Br 时，Br 是偈颂
+                # 分行符（结构如 <Content>。</Content><Br /><Content>下一行</Content>），
+                # 必须保留——清空 Content 保留 Br，否则多行偈颂合并成一行。
+                # 26 号（發覺淨心經）PSR[0] 有 18 个此类 CSR，旧实现整个
+                # 删除（含 Br）导致输出 Br 136→107、验证失败。
+                # leading 位置（ci < min_text_idx）仍删除：段首 Br 空 CSR
+                # 会产生段首空行（275 回归：分割段 Para[7] leading Br）。
+                # 注意: is_punct 判定含「Content 为『。』但样式非句号」的
+                # CSR（InDesign 原文旧句号常见样式，如 [No character style]）。
+                if has_br and not is_leading:
                     csr_replacements[ci] = _clear_content_keep_br(
                         orig_csr, strip_groups=is_split_copy
                     )
@@ -1463,7 +1629,9 @@ def _rebuild_paragraph_xml(
             continue
 
         if cdata['is_punct']:
-            # 旧句号 CSR：保留原 CSR 中的 Br，Content 用模板替换
+            # 旧句号 CSR：v1.5.2 复用 CSR 自身模板（保留各 CSR 自身
+            # PointSize/FillColor/Br），Content 替换为实际标点。
+            # （v1.5.0/1.5.1 用全局 punct_template，丢失自身样式。）
             orig_csr = cdata['match'].group(0)
             has_br = '<Br' in orig_csr
             punct_segments = [t for is_p, t, _, _ in segments if is_p]
@@ -1475,25 +1643,37 @@ def _rebuild_paragraph_xml(
                 # 不作为 punct CSR 处理，fall through 到文字 CSR 逻辑。
                 pass
             elif not punct_segments:
-                # 无新句号 → 清空 Content
+                # 无新标点 → 清空 Content（保留 Br 防偈颂分行丢失）
                 csr_replacements[ci] = (
                     _clear_content_keep_br(orig_csr, strip_groups=is_split_copy)
                     if has_br else ''
                 )
                 continue
-            elif punct_template:
-                # v1.5.0: 逐标点用模板生成 CSR，Content 替换为实际标点
-                # （旧实现 ''.join(punct_template ...) 会把 ，、？ 等
-                # 新标点错误写成模板里的「。」）
-                fill = ''.join(
-                    _punct_csr_from_template(punct_template, t)
-                    for t in punct_segments
-                )
-                if has_br:
-                    # 模板可能无 Br → 在最后追加原 CSR 的 Br
-                    br_match = re.search(r'<Br\s*/>', orig_csr)
-                    if br_match and '<Br' not in fill:
-                        fill += br_match.group(0)
+            else:
+                # v1.5.2 方案 C：复用自身模板。分割副本（is_split_copy）
+                # 先剥离 Group + Self（防重复 Self ID；v1.5.1 只剥离
+                # Group，Self 遗留会造成 ID 冲突）。
+                own = orig_csr
+                if is_split_copy:
+                    own = re.sub(
+                        r'<Group[^>]*>.*?</Group>', '', own, flags=re.DOTALL
+                    )
+                    own = re.sub(r'Self="[^"]*"', '', own)
+                if len(punct_segments) == 1:
+                    # 单标点：直接替换 Content，其余标签（含 Br）原样保留
+                    fill = _punct_csr_from_own_template(own, punct_segments[0])
+                else:
+                    # 多标点（罕见，如「。、」）：去 Br 逐标点生成，拼接后
+                    # 末尾补回一个 Br（模板复制多次只保留最后一份 Br）
+                    base = re.sub(r'<Br\s*/>', '', own)
+                    fill = ''.join(
+                        _punct_csr_from_own_template(base, t)
+                        for t in punct_segments
+                    )
+                    if has_br:
+                        br_match = re.search(r'<Br\s*/>', orig_csr)
+                        if br_match and '<Br' not in fill:
+                            fill += br_match.group(0)
                 csr_replacements[ci] = fill
                 continue
             continue
@@ -1558,8 +1738,12 @@ def _rebuild_paragraph_xml(
                     parts_xml = (parts_xml[:pos] + new_ctag
                                  + parts_xml[pos + len(old_ctag):])
                     cursor = pos + len(new_ctag)
-                if is_split_copy:
-                    parts_xml = re.sub(r'<Br\s*/>', '', parts_xml)
+                # v1.5.1-Br 修复: 原实现在此剥离分割副本（is_split_copy）
+                # 多 Content CSR 的全部 Br，导致分割段偈颂分行丢失
+                # （26 号分割副本 31 Br → 2 Br）。多 Content CSR 的 Br 位于
+                # Content 之间（行间换行），是偈颂分行结构，必须保留；
+                # 分割副本的 leading 空壳 Br 由 A3（_DROP_CSR）分支处理，
+                # 此处不再整体剥离。
                 csr_replacements[ci] = parts_xml
             else:
                 csr_replacements[ci] = csr_xml
@@ -1588,20 +1772,44 @@ def _rebuild_paragraph_xml(
             # FIX-4: 拆分副本非首段剥离 Self 属性（仅首段保留原 Self，
             # 中间/句号段复用会导致同一 Self ID 出现在多个 CSR 中）
             clean_prefix = re.sub(r'Self="[^"]*"', '', clean_prefix)
+            # 中间段 suffix 用仅闭标签（无 Br/空白，与 v1.4.3 字节一致）；
+            # 最后一段（parts[-1]）由下方 replace 换成 csr_suffix——
+            # csr_suffix 定义于文字 CSR 处理开头（csr_xml[content_end:]，
+            # 含 Content 后的 Br 与格式化空白），偈颂行尾换行由此保留。
             clean_suffix = csr_xml[csr_xml.rfind('</CharacterStyleRange>'):]
-            non_punct_parts = [i for i, (is_p, _, _, _) in enumerate(segments)
-                               if not is_p]
-            # 找到最后一个文本 segment 的索引，供句号继承其前缀
-            last_text_idx: int | None = None
-            parts = []
+            # v1.5.2 改动点 3: 连续文字 segment 合并为一个 CSR，消除逐字拆分
+            # （现在: 等|輩|求|諸|利|義|必|不|如|意|。 → 11 个 CSR；
+            #   修复: 等輩求諸利義必不如意|。 → 2 个 CSR）。
+            # 块结构: (is_punct, text, bno)
+            #   文字块 bno = 文字块序号（0 = 第一个文字块，前缀 csr_prefix，
+            #   其余用 clean_prefix）；标点块 bno = -1。
+            blocks: list[tuple[bool, str, int]] = []
+            text_block_no = 0
             for i, (is_p, text, _slot, _pos) in enumerate(segments):
                 if is_p:
-                    if last_text_idx is not None:
-                        # 句号继承 last_text_idx 对应文字的前缀
-                        text_pfx = csr_prefix if last_text_idx == non_punct_parts[0] else clean_prefix
-                    else:
-                        # 段首句号：回退到全局模板（极少见）
-                        text_pfx = csr_prefix
+                    blocks.append((True, text, -1))
+                elif blocks and not blocks[-1][0]:
+                    b = blocks[-1]
+                    blocks[-1] = (False, b[1] + text, b[2])
+                else:
+                    blocks.append((False, text, text_block_no))
+                    text_block_no += 1
+            # 找到最后一个文字块的序号，供句号继承其前缀
+            last_text_bno: int | None = None
+            parts = []
+            for is_p, text, bno in blocks:
+                if is_p:
+                    # 句号继承前邻文字块的前缀（段首句号回退 csr_prefix）
+                    text_pfx = (
+                        csr_prefix
+                        if last_text_bno is None or last_text_bno == 0
+                        else clean_prefix
+                    )
+                    # v1.5.2 修复（461 回归 Br 44→45）：标点块不得继承
+                    # 行首 Br。csr_prefix 含 Br（原始 CSR 行首换行）时，
+                    # 标点块带上 Br 会被换行到下一行（便梵行至佛区域
+                    # 多出 1 个 Br）。样式继承保留，仅剥离 Br。
+                    text_pfx = re.sub(r'<Br\s*/>', '', text_pfx)
                     # 强制 AppliedFont 为思源宋体，确保句号在所有字体中正常显示。
                     # 继承前邻文字的 PointSize 等属性（通过 text_pfx），但覆盖字体。
                     text_pfx = re.sub(
@@ -1618,13 +1826,13 @@ def _rebuild_paragraph_xml(
                         + clean_suffix
                     )
                 else:
-                    pfx = csr_prefix if i == non_punct_parts[0] else clean_prefix
+                    pfx = csr_prefix if bno == 0 else clean_prefix
                     parts.append(
                         pfx
                         + f'<Content>{_xml_escape(text)}</Content>'
                         + clean_suffix
                     )
-                    last_text_idx = i
+                    last_text_bno = bno
             # 后缀加在整个拆分序列末尾
             parts[-1] = parts[-1].replace(clean_suffix, csr_suffix)
             csr_replacements[ci] = ''.join(parts)
@@ -2003,10 +2211,19 @@ def _verify_structure(
         )
 
     # ---- 2: Br 数量合理性 ----
+    # v1.5.1-Br 修复: 旧句号 CSR 判定与 _rebuild_paragraph_xml 的 is_punct
+    # 一致（样式含 CharacterStyle/句号 或 Content 为「。」）。旧实现只认
+    # 样式名，26 号原文旧句号样式为 [No character style]（Content='。'）
+    # → br_in_old_punct 漏计 18 → 验证误报 Br 丢失。
     csr_pattern = (
-        r'<CharacterStyleRange([^>]*?CharacterStyle/句号[^>]*?)>'
-        r'.*?</CharacterStyleRange>'
+        r'<CharacterStyleRange([^>]*?)(?:>(.*?)</CharacterStyleRange>|/>)'
     )
+
+    def _is_old_punct_csr(m: re.Match) -> bool:
+        inner = m.group(2) or ''
+        contents = re.findall(r'<Content>(.*?)</Content>', inner, re.DOTALL)
+        return ('CharacterStyle/句号' in m.group(1)
+                or ''.join(contents) == '。')
 
     in_br_total = 0
     out_br_total = 0
@@ -2022,6 +2239,7 @@ def _verify_structure(
         br_in_old_punct += sum(
             _count_br(m.group(0))
             for m in re.finditer(csr_pattern, in_xml, re.DOTALL)
+            if _is_old_punct_csr(m)
         )
 
         for psr in re.finditer(
@@ -2040,7 +2258,35 @@ def _verify_structure(
                 if not any(c.strip() for c in contents):
                     br_in_orig_empty += _count_br(m.group(0))
 
-    br_min = max(0, in_br_total - br_in_old_punct - br_in_orig_empty)
+    # v1.5.1-Br: 分割豁免——分割源段 trailing 区域（最后一个文字记录 CSR
+    # 之后）的无记录 CSR 的 Br 会在重建时被 A4 剥离（文字已移入分割段，
+    # 该区域 Br 是分割点后的换行残留，剥离属预期清理）。若不豁免，
+    # 26 号等「偈颂分行 + 段落边界」文件会误报 Br 丢失。豁免只针对
+    # 分割源段；未分割段落（如 PSR[0] 的 Bug A 场景）的 Br 仍严格检查。
+    br_split_waiver = 0
+    waiver_csr = re.compile(csr_pattern)
+    for (si, _new_pi), orig_pi in split_sources.items():
+        if si >= len(stories) or orig_pi >= len(stories[si]['paragraphs']):
+            continue
+        recs = grouped_records.get(si, {}).get(orig_pi, [])
+        text_idxes = [
+            r['csr_idx'] for r in recs
+            if not r.get('is_punct', False)
+            and not r.get('is_special', False)
+            and r.get('csr_idx', -1) >= 0
+        ]
+        if not text_idxes:
+            continue
+        max_ti = max(text_idxes)
+        psr_xml = stories[si]['paragraphs'][orig_pi]['raw_xml']
+        for ci, m in enumerate(waiver_csr.finditer(psr_xml)):
+            if ci > max_ti:
+                br_split_waiver += _count_br(m.group(0))
+
+    br_min = max(
+        0,
+        in_br_total - br_in_old_punct - br_in_orig_empty - br_split_waiver,
+    )
 
     if out_br_total < br_min:
         errors.append(
@@ -2155,7 +2401,11 @@ def _verify_br_count(
 
     字符级输出验证（_verify_output）是真正的质量保证。
     """
-    csr_pattern = r'<CharacterStyleRange([^>]*?CharacterStyle/句号[^>]*?)>.*?</CharacterStyleRange>'
+    # v1.5.1-Br: 与 _verify_structure 同口径——旧句号 CSR 判定含
+    # Content 为「。」但样式非 CharacterStyle/句号 的 CSR（26 号场景）。
+    csr_pattern = (
+        r'<CharacterStyleRange([^>]*?)(?:>(.*?)</CharacterStyleRange>|/>)'
+    )
 
     in_br_total = 0
     out_br_total = 0
@@ -2168,6 +2418,9 @@ def _verify_br_count(
         br_in_old_punct += sum(
             _count_br(m.group(0))
             for m in re.finditer(csr_pattern, in_xml, re.DOTALL)
+            if ('CharacterStyle/句号' in m.group(1)
+                or ''.join(re.findall(r'<Content>(.*?)</Content>',
+                                      m.group(2) or '', re.DOTALL)) == '。')
         )
 
     br_cleared_text = in_br_total - br_in_old_punct - out_br_total
@@ -2210,6 +2463,9 @@ def _verify_output(
             1 for para in story['paragraphs']
             for rec in para['chars']
             if not rec['is_punct'] and not rec.get('is_special', False)
+            # v1.5.3: 与 validate_and_align 口径一致，成对符号（is_bracket）
+            # 不参与正文判定
+            and not rec.get('is_bracket', False)
             and not _is_unicode_whitespace(rec['char'])
         )
         if story_clean < min_clean_chars:

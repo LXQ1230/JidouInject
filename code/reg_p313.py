@@ -47,6 +47,27 @@ def zip_members_bytes(path: str) -> dict[str, bytes]:
     return result
 
 
+def story_text_contents(path: str) -> dict[str, str]:
+    """提取每个 Story 的全部 Content 净文本（去加工指令、解实体）。
+
+    用于内容级回归：v1.5.1-Br 修复 1 保留旧句号 CSR 的 Br 分行符
+    （清空 Content 的空+Br CSR），输出 ZIP 成员字节必然变化，但所有
+    Story 的字符内容必须与旧代码输出完全一致。
+    """
+    import html
+    import re as _re
+    result = {}
+    with zipfile.ZipFile(path) as zf:
+        for name in zf.namelist():
+            if name.startswith('Stories/Story_'):
+                raw = zf.read(name).decode('utf-8')
+                contents = _re.findall(
+                    r'<Content>(.*?)</Content>', raw, _re.DOTALL)
+                text = _re.sub(r'<\?.*?\?>', '', ''.join(contents))
+                result[name] = html.unescape(text)
+    return result
+
+
 def run(mod, idml, result, out_path):
     try:
         mod.process(idml, result, out_path)
@@ -88,12 +109,27 @@ def main():
             diff_names = names_old ^ names_new
             diff_bytes = [n for n in names_old & names_new if m_old[n] != m_new[n]]
             if diff_names or diff_bytes:
-                all_ok = False
-                print(f"    [回归失败] 输出不一致:")
-                for n in sorted(diff_names):
-                    print(f"      - 成员差异: {n}")
-                for n in sorted(diff_bytes)[:5]:
-                    print(f"      - 字节差异: {n} (旧 {len(m_old[n])}B vs 新 {len(m_new[n])}B)")
+                # v1.5.1-Br: 字节不一致时回退内容级对比（与 reg_p314 一致）。
+                # 修复 1（保留旧句号 CSR 的 Br 分行符）会让 461/275 输出
+                # 多出清空 Content 的空+Br CSR，字节必然变化，但所有 Story
+                # 的字符内容必须与旧代码输出完全一致。
+                c_old = story_text_contents(out_old)
+                c_new = story_text_contents(out_new)
+                content_diff = [n for n in c_old
+                                if n not in c_new or c_old[n] != c_new[n]]
+                if diff_names or content_diff:
+                    all_ok = False
+                    print(f"    [回归失败] 输出不一致:")
+                    for n in sorted(diff_names):
+                        print(f"      - 成员差异: {n}")
+                    for n in sorted(content_diff)[:5]:
+                        print(f"      - 内容差异: {n} "
+                              f"(旧 {len(c_old.get(n,''))}字 vs "
+                              f"新 {len(c_new.get(n,''))}字)")
+                else:
+                    print(f"    [通过] 内容一致；字节差异仅 Br 分行保留"
+                          f"（{len(diff_bytes)} 个 Story，"
+                          f"净增 {sum(len(m_new[n])-len(m_old[n]) for n in diff_bytes)/1024:.0f}KB）")
             else:
                 print(f"    [通过] 输出 ZIP 全成员字节一致 "
                       f"({len(m_new)} 个成员, 含 {name}导出_WD注入 语义)")

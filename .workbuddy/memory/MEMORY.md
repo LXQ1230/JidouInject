@@ -2,8 +2,37 @@
 
 ## 代码版本与备份惯例
 - 每次修复先备份 `code/inject.py` 到 `backup/inject.py.v{版本}-{说明}-{日期}.bak`
-- 当前版本：v1.5.0（标点开放，2026-08-06）
+- 当前版本：v1.5.3（括号+几何符号保留，2026-08-07）
 - 修复编号沿用 fix-plan-2026-08-04.md 的 P0-P3 体系
+
+## v1.5.3 保留排版符号知识（重要，防复发）
+- **范围**：成对符号 `_KEEP_BRACKETS`（（）()〔〕《》〈〉「」『』【】〖〗［］）+ 几何装饰符号 `_KEEP_ORNAMENTS`（■□△▲○●◇◆ 及变体/星/※，约 30 个）；统一入口 `_is_keep_symbol`
+- **机制**（与括号同构）：解析 `is_punct=False + is_bracket=True` → `_is_ws_for_compare` 返回 True（对齐不消费 txt、字体查找跳过、比对排除）→ 对齐 while ws 分支作为文字记录保留 → 重建 Content 原样输出
+- **必须同步的统计口径**：story_clean_count（validate_and_align）与 _verify_output 的正文 Story 判定排除 is_bracket（防含符号装饰 Story 误判）
+- **20 号（pending/20.idml）**：正文含字间镶嵌几何符号（「如■是□我◎聞一◇時佛▲住△…」7 个）+ 校勘注全角圆括号 9 对（（甯）（磧）（清）（大）（卍）（麗）（宋）（元）（明））+ ．40/.1 旧标点（自动清除）。题记「唐三藏法師菩提流志奉詔譯」在装饰 Story（12 字 <50）自动跳过——**不是障碍**。跑通后保留符号 25→25 零丢失、正文文字 == txt（14821 字）、句号复用 2386/2425（98.4%）
+- **txt 含 ○**：句读结果保留 ○ 位置（「卷第十七○原本為」）——对齐时 txt 的 ○ 走 `_is_ws_for_compare` 跳过，不消费 IDML ✓
+- **回归**：reg_v152.py 的 `_KEEP_BRACKETS` 含几何符号（统一统计）；SPECIAL 加 20 号用例（纯句号 L3 判定：句号复用 ≥90%，非 35 号混合标点判定）
+
+## v1.5.2 标点重分配知识（重要，防复发）
+- **方案 C 目标**：消除逐字 CSR 拆分导致的体积膨胀与排版异常（35 号混合标点 2.87MB → 284KB ≈ 原始 283KB；CSR 9396 → 4047）。方案文档：plan-csr-reuse-and-brackets-2026-08-07.md
+- **改动点 1（重分配主路径）**：文字 CSR 末尾标点（after_pos ≥ 槽位末尾偏移，槽位末尾用 `len(orig_contents[last_slot])-1` 计算——**对齐后文字记录 slot_pos 恒为 0**，不能用 segment pos）转移进后邻 segments 为空的旧句号 CSR。文字 CSR 零改动走合并路径
+- **改动点 2（复用分支）**：`_punct_csr_from_own_template`（优先替换含「。」的 Content）替代全局 punct_template，保留各 CSR 自身 PointSize/FillColor/Br；分割副本先剥离 Group+Self；多标点去 Br 拼接 + 末尾补 Br
+- **改动点 3（拆分兜底）**：无法重分配的标点（CSR 中间/后邻非句号 CSR）走拆分路径时**连续文字 segment 合并为一个 CSR**（blocks 机制：文字块 bno 0 用 csr_prefix 其余 clean_prefix；标点块继承前邻文字块前缀但**必须剥离 Br**——否则行首 Br 被标点继承导致 Br+1，461 回归 Br 44→45 的根因）
+- **回归判定口径**（reg_v152.py，三层验证）：
+  - L1 净文本：CASES 新旧逐 Story 完全一致；SPECIAL 35 号对比**正文 Story（clean≥50）文字序列 vs txt**（去标点去全部空白——IDML 有 3 个 ASCII 空格被对齐跳过属预期；装饰 Story 页眉「佛說離垢施女經」不参与对齐）
+  - L2：br/psr 新 vs 旧必须相等；csr 新≤旧；**single1 对比原始 IDML ×1.3**（275 原文即逐字 CSR 结构 2669→新 2674 属正常，旧 5302 才是拆分膨胀）；oldpunct 只认 `CharacterStyle/句号` 样式（Content=='。' 的兜底拆分 CSR 不计，否则 461 虚增 1297→1546）；preserved_multichar ≥95% 硬通过 / 85-95% 警告（461 86.4% 为数据特性：txt 句读密度高 + IDML 长句块多，句号在 CSR 中间属必要拆分）
+  - L3：样式三元组（AppliedFont/PointSize/FillColor）按文本匹配对比 0 差异；35 号句号 CSR 复用抽查（Content 为实际标点）
+- **35 号混合标点 txt**：`done/35/35_WD句读结果_vs_35_对比文本_20260807-0900.txt`（815 句号+702 逗号+190 顿号）；「時、離垢施女、則為梵志而說頌曰」是方案 C 复现点，IDML 原文此处有独立旧句号 CSR，重分配生效
+- 回归脚本：`code/reg_v152.py`（字节级对比退出历史舞台，由净文本+结构指标+样式抽查替代）
+
+## v1.5.1 Br 分行知识（重要，防复发）
+- **偈颂分行结构**：InDesign 偈颂排版 = 多 Content CSR 内嵌 `<Br />`（`<Content>一行</Content><Br /><Content>二行</Content>`），Br 也可在 CSR 前缀（行首）或 Content 后（行尾）。Br 是段内软换行，删除会让多行偈颂合并成一行
+- **旧句号 CSR 判定口径**：`is_punct` = 样式含 `CharacterStyle/句号` **或** Content 为「。」——26 号原文旧句号样式是 `[No character style]`（验证原口径只认样式名 → 漏计 Br 豁免 → 误报）
+- **无记录旧句号 CSR（A1）**：带 Br 且非 leading → 必须 `_clear_content_keep_br` 保留（清空 Content + Br）；leading 删除（防段首空行，275 回归）。旧实现整体删除 → 偈颂分行丢失
+- **多 Content 分割副本**：禁止整体剥 Br（`is_split_copy` 剥 Br 是 v1.4.1 遗留 bug，26 号副本 31 Br → 2 Br）；leading 空壳由 A3 `_DROP_CSR` 处理
+- **分割豁免（验证）**：`_verify_structure` 的 br_min 要扣除分割源段 trailing 区域（最后一个文字记录 CSR 之后）的无记录 CSR Br——分割移走文字后该区域 Br 剥离属预期清理，不豁免会误报（偈颂+段落边界文件）
+- **拆分 suffix 细节**：csr_suffix 定义于文字 CSR 处理开头（`csr_xml[content_end:]`，含 Br），clean_suffix 用 rfind 截取（仅闭标签）——**不要**把 clean_suffix 改成 content_end 截取（3093 会多格式化空白 `\n\t\t\t` 字节回归）
+- 回归脚本：`code/reg_p150.py` / `reg_p313.py` / `reg_p314.py`（461/275/3093，字节不一致回退内容级对比，允许 Br 分行保留差异）；`reg_p150_mixed.py`（`c in PUNCTS` 对空串误判 True → 须 `c and` 前置）；`reg_p150_497.py`（497 与 v1.4.3 基线内容级对比）
 
 ## v1.5.0 标点白名单知识（重要，防复发）
 - **可回注标点**：`_INJECTABLE_PUNCT = '，、；：？！。'`（_OLD_PUNCT_CHARS 的子集）。FIX-1B 只放行白名单内标点，白名单外旧标点（引号/括号/书名号等成对符号）仍一律拒绝——它们是原文排版装饰符号，不属于句读结果

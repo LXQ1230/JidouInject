@@ -6,3 +6,9 @@ done/
 backup/
 *.idml
 *.indd
+dist/
+jd_exe_test*/
+nuitka-crash-report.xml
+launcher.build/
+launcher.dist/
+launcher.onefile-build/
